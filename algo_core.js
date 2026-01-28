@@ -1453,34 +1453,6 @@ function calcSimilarityStats(closes, winLen, futureH, step, topK){
 
 
 // ✅ BRAIN UPGRADE v3: 멀티 윈도우 유사도 앙상블(과적합 완화 + 안정성)
-function calcSimilarityStatsEnsemble(closes, winLen, futureH, step, topK){
-  const w1 = Math.max(25, Math.round(winLen * 0.8));
-  const w2 = Math.max(30, winLen);
-  const w3 = Math.max(35, Math.round(winLen * 1.2));
-
-  const a = calcSimilarityStats(closes, w1, futureH, step, topK);
-  const b = calcSimilarityStats(closes, w2, futureH, step, topK);
-  const c = calcSimilarityStats(closes, w3, futureH, step, topK);
-
-  const wa = Math.max(1, a.count);
-  const wb = Math.max(1, b.count) * 1.15; // 기준 윈도우를 약간 우대
-  const wc = Math.max(1, c.count);
-
-  const sum = wa + wb + wc;
-
-  const longProb = (a.longProb*wa + b.longProb*wb + c.longProb*wc) / sum;
-  const shortProb = (a.shortProb*wa + b.shortProb*wb + c.shortProb*wc) / sum;
-
-  const avgSim = (a.avgSim*wa + b.avgSim*wb + c.avgSim*wc) / sum;
-  const count = Math.round((a.count + b.count + c.count) / 3);
-
-  // 분산(윈도우 간 충돌)을 간단히 계산해서 품질 페널티에 사용
-  const lp = [a.longProb, b.longProb, c.longProb];
-  const mp = (lp[0]+lp[1]+lp[2])/3;
-  const varP = ((lp[0]-mp)**2 + (lp[1]-mp)**2 + (lp[2]-mp)**2)/3;
-
-  return { longProb, shortProb, avgSim, count, varP };
-}
 
 function returns(seg){
   const out = [];
