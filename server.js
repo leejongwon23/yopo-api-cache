@@ -1,177 +1,138 @@
-import express from "express";
-
 /**
- * YOPO API Cache Server (Render)
- * 목적: 브라우저가 거래소/코인게코를 직접 많이 호출해서 먹통이 되는 문제를 해결
- * 방식: 서버가 데이터 수집 + 캐시 + 요청폭주 방지 → 브라우저는 서버만 호출
+ * YOPO API Cache (Render) — server.js
+ * 역할: 브라우저 과부하/지연 방지용 "캐시/스로틀/중계" 서버
  *
- * ✅ 지원 라우트 (브라우저는 이 주소만 호출)
- * - GET /                         : health
- * - GET /api/bybit/tickers
- * - GET /api/bybit/kline?symbol=BTCUSDT&interval=60&limit=500
- * - GET /api/cg/global
- * - GET /api/cg/markets?...       : 쿼리 그대로 전달
- * - GET /api/binance/fapi/klines?...            (기본: data-api.binance.vision)
- * - GET /api/binance/spot/klines?...
- * - GET /api/binance/fapi/klines_fallback?...   (공식 도메인, 막힐 수 있음)
- * - GET /api/binance/spot/klines_fallback?...
+ * ✅ 원칙(중요)
+ * 1) 브라우저는 서버를 먼저 호출한다. (속도/안정)
+ * 2) 서버가 죽거나 잠들면 브라우저는 직접 호출로 자동 폴백한다. (안전)
+ * 3) Bybit은 Render(US)에서 403(CloudFront 국가/지역 차단) 가능 → 브라우저 직호출이 기본
+ *
+ * ✅ 제공 라우트
+ * - GET /                       : 헬스체크
+ * - GET /api/cg/global          : CoinGecko global (캐시)
+ * - GET /api/cg/markets         : CoinGecko markets (쿼리 그대로 전달, 캐시)
+ * - GET /api/binance/fapi/klines: Binance Vision futures klines (쿼리 전달, 캐시)
+ * - GET /api/binance/spot/klines: Binance Vision spot klines (쿼리 전달, 캐시)
+ *
+ * (선택) Bybit 라우트는 만들 수 있지만, Render에서 막힐 수 있어 추천하지 않음.
  */
 
-const app = express();
-app.disable("x-powered-by");
+import express from "express";
+import fetch from "node-fetch";
 
-// --- CORS (GitHub Pages/브라우저에서 바로 호출 가능)
-app.use((req, res, next) => {
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// ----- TTL (초)
+const TTL = {
+  cgGlobal: 60,
+  cgMarkets: 60,
+  binanceKline: 10,
+};
+
+// ----- 간단 메모리 캐시 (Render Free에서도 동작)
+const mem = new Map(); // key -> { exp:number, status:number, headers:object, body:Buffer }
+
+function nowMs(){ return Date.now(); }
+function okCors(res){
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET,OPTIONS");
   res.setHeader("access-control-allow-headers", "*");
-  if (req.method === "OPTIONS") return res.status(200).send("ok");
+}
+
+app.use((req,res,next)=>{
+  okCors(res);
+  if(req.method === "OPTIONS") return res.status(200).send("ok");
   next();
 });
 
-// --- 간단 메모리 캐시 + TTL
-const cache = new Map(); // key -> { exp, status, headers, body(Buffer) }
-const now = () => Date.now();
+app.get("/", (req,res)=>{
+  res.type("text/plain").send("YOPO API Cache OK");
+});
 
-function cacheGet(key) {
-  const v = cache.get(key);
-  if (!v) return null;
-  if (v.exp <= now()) { cache.delete(key); return null; }
-  return v;
-}
-function cacheSet(key, ttlSec, status, headers, body) {
-  cache.set(key, { exp: now() + ttlSec * 1000, status, headers, body });
-  // 캐시 과도 증가 방지
-  if (cache.size > 1200) {
-    const first = cache.keys().next().value;
-    cache.delete(first);
-  }
-}
-
-// --- 요청 폭주 방지(동시요청 제한)
-let inflight = 0;
-const MAX_INFLIGHT = 30;
-
-async function guardedFetch(url) {
-  if (inflight >= MAX_INFLIGHT) {
-    await new Promise(r => setTimeout(r, 120));
-  }
-  inflight++;
-  try {
-    return await fetch(url, {
-      method: "GET",
-      headers: {
-        "user-agent": "YOPO-Render-Cache",
-        "accept": "application/json,text/plain,*/*"
-      }
-    });
-  } finally {
-    inflight--;
-  }
-}
-
-function pickContentType(res) {
-  return res.headers.get("content-type") || "application/json; charset=utf-8";
-}
-
-async function proxyCached(res, upstreamUrl, ttlSec) {
-  const key = upstreamUrl;
-  const hit = cacheGet(key);
-  if (hit) {
-    res.status(hit.status);
-    for (const [k, v] of Object.entries(hit.headers)) res.setHeader(k, v);
-    return res.end(hit.body);
+async function fetchAndCache(key, upstreamUrl, ttlSec){
+  const hit = mem.get(key);
+  if(hit && hit.exp > nowMs()){
+    return hit;
   }
 
-  const up = await guardedFetch(upstreamUrl);
-  const buf = Buffer.from(await up.arrayBuffer());
+  const r = await fetch(upstreamUrl, {
+    method: "GET",
+    headers: {
+      "user-agent": "YOPO-Render-Cache",
+      "accept": "*/*",
+    },
+  });
 
-  const headers = {
-    "content-type": pickContentType(up),
-    "cache-control": `public, max-age=${ttlSec}`
-  };
+  const buf = Buffer.from(await r.arrayBuffer());
+  const headers = {};
+  r.headers.forEach((v,k)=>{ headers[k.toLowerCase()] = v; });
 
-  if (!up.ok) {
-    res.status(up.status);
-    for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
-    return res.end(buf);
-  }
-
-  cacheSet(key, ttlSec, up.status, headers, buf);
-
-  res.status(up.status);
-  for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
-  return res.end(buf);
+  const out = { exp: nowMs() + ttlSec*1000, status: r.status, headers, body: buf };
+  // 성공만 캐시 (실패는 캐시 안 함)
+  if(r.ok) mem.set(key, out);
+  return out;
 }
 
-const TTL = {
-  bybitTickers: 2,
-  bybitKline: 10,
-  cgGlobal: 60,
-  cgMarkets: 60,
-  binanceKline: 10
-};
+function sendCached(res, c){
+  // content-type 유지 (없으면 json 추정 X, 그대로)
+  if(c.headers?.["content-type"]) res.setHeader("content-type", c.headers["content-type"]);
+  res.setHeader("cache-control", "public, max-age=0");
+  okCors(res);
+  res.status(c.status).send(c.body);
+}
 
-app.get("/", (req, res) => res.status(200).send("YOPO API Cache OK"));
-
-// --- Bybit
-app.get("/api/bybit/tickers", (req, res) => {
-  const upstream = "https://api.bybit.com/v5/market/tickers?category=linear";
-  return proxyCached(res, upstream, TTL.bybitTickers);
+/** CoinGecko: global */
+app.get("/api/cg/global", async (req,res)=>{
+  try{
+    const upstream = "https://api.coingecko.com/api/v3/global";
+    const key = "cg:global";
+    const c = await fetchAndCache(key, upstream, TTL.cgGlobal);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-app.get("/api/bybit/kline", (req, res) => {
-  const symbol = String(req.query.symbol || "").toUpperCase();
-  const interval = String(req.query.interval || "60");
-  const limit = String(req.query.limit || "500");
-  if (!symbol) return res.status(400).send("Missing symbol");
-
-  const upstream =
-    "https://api.bybit.com/v5/market/kline?category=linear" +
-    `&symbol=${encodeURIComponent(symbol)}` +
-    `&interval=${encodeURIComponent(interval)}` +
-    `&limit=${encodeURIComponent(limit)}`;
-
-  return proxyCached(res, upstream, TTL.bybitKline);
+/** CoinGecko: markets (쿼리 그대로 전달) */
+app.get("/api/cg/markets", async (req,res)=>{
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://api.coingecko.com/api/v3/coins/markets" + (qs ? ("?"+qs) : "");
+    const key = "cg:markets:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.cgMarkets);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-// --- CoinGecko
-app.get("/api/cg/global", (req, res) => {
-  const upstream = "https://api.coingecko.com/api/v3/global";
-  return proxyCached(res, upstream, TTL.cgGlobal);
+/** Binance Vision: futures klines */
+app.get("/api/binance/fapi/klines", async (req,res)=>{
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://data-api.binance.vision/fapi/v1/klines" + (qs ? ("?"+qs) : "");
+    const key = "bn:fut:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.binanceKline);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-app.get("/api/cg/markets", (req, res) => {
-  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-  const upstream = `https://api.coingecko.com/api/v3/coins/markets${qs}`;
-  return proxyCached(res, upstream, TTL.cgMarkets);
+/** Binance Vision: spot klines */
+app.get("/api/binance/spot/klines", async (req,res)=>{
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://data-api.binance.vision/api/v3/klines" + (qs ? ("?"+qs) : "");
+    const key = "bn:spot:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.binanceKline);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-// --- Binance (Vision 미러)
-app.get("/api/binance/fapi/klines", (req, res) => {
-  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-  const upstream = `https://data-api.binance.vision/fapi/v1/klines${qs}`;
-  return proxyCached(res, upstream, TTL.binanceKline);
+app.listen(PORT, ()=>{
+  console.log("Listening on", PORT);
 });
-
-app.get("/api/binance/spot/klines", (req, res) => {
-  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-  const upstream = `https://data-api.binance.vision/api/v3/klines${qs}`;
-  return proxyCached(res, upstream, TTL.binanceKline);
-});
-
-// --- Binance 공식(막힐 수 있음)
-app.get("/api/binance/fapi/klines_fallback", (req, res) => {
-  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-  const upstream = `https://fapi.binance.com/fapi/v1/klines${qs}`;
-  return proxyCached(res, upstream, TTL.binanceKline);
-});
-
-app.get("/api/binance/spot/klines_fallback", (req, res) => {
-  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
-  const upstream = `https://api.binance.com/api/v3/klines${qs}`;
-  return proxyCached(res, upstream, TTL.binanceKline);
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Listening on", PORT));
