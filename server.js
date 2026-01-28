@@ -1,538 +1,209 @@
 /**
- * YOPO AI PRO (Render) — server.js  ✅ v4 (SERVER-ENGINE)
- * 목표:
- * - 브라우저 과부하/지연을 끝내기 위해 "계산(자동스캔/백테스트/통합예측)"을 서버가 수행
- * - 브라우저는 결과 표시(UI)만 담당
+ * YOPO API Cache (Render) — server.js
+ * 역할: 브라우저 과부하/지연 방지용 "캐시/스로틀/중계" 서버
+ *
+ * ✅ 원칙(중요)
+ * 1) 브라우저는 서버를 먼저 호출한다. (속도/안정)
+ * 2) 서버가 죽거나 잠들면 브라우저는 직접 호출로 자동 폴백한다. (안전)
+ * 3) Bybit은 Render(US)에서 403(CloudFront 국가/지역 차단) 가능 → 브라우저 직호출이 기본
  *
  * ✅ 제공 라우트
- * - GET  /                     : 헬스체크
- * - GET  /ping                 : keepalive
- * - GET  /api/cg/global         : CoinGecko global (캐시)
- * - GET  /api/cg/markets        : CoinGecko markets (쿼리 전달, 캐시)
- * - GET  /api/binance/fapi/klines     : Binance Vision futures klines (쿼리 전달, 캐시)
- * - GET  /api/binance/spot/klines     : Binance Vision spot klines (쿼리 전달, 캐시)
- * - GET  /api/binance/fapi/ticker24hr : Binance Vision futures 24hr ticker (캐시)
+ * - GET /                       : 헬스체크
+ * - GET /api/cg/global          : CoinGecko global (캐시)
+ * - GET /api/cg/markets         : CoinGecko markets (쿼리 그대로 전달, 캐시)
+ * - GET /api/binance/fapi/klines: Binance Vision futures klines (쿼리 전달, 캐시)
+ * - GET /api/binance/spot/klines: Binance Vision spot klines (쿼리 전달, 캐시)
  *
- * ✅ 계산 엔진(서버)
- * - POST /api/scan      : TOP(추천) + FULL(전체표) 계산
- * - POST /api/backtest  : 백테스트 계산
- * - POST /api/predict   : 통합예측(6전략) 계산
- *
- * ⚠️ 주의
- * - Render Free는 슬립될 수 있음 → /ping + 브라우저 keepalive로 깨움
- * - 서버가 죽으면(또는 네트워크 문제) 브라우저 폴백(직접 호출)이 동작하도록 클라이언트가 설계됨
+ * (선택) Bybit 라우트는 만들 수 있지만, Render에서 막힐 수 있어 추천하지 않음.
  */
 
 import express from "express";
-import fs from "fs";
-import path from "path";
-import vm from "vm";
 
 const app = express();
+app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 10000;
-
-app.use(express.json({ limit: "2mb" }));
-
-function okCors(res){
-  res.setHeader("access-control-allow-origin", "*");
-  res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
-  res.setHeader("access-control-allow-headers", "*");
-}
-app.use((req,res,next)=>{
-  okCors(res);
-  if(req.method === "OPTIONS") return res.status(200).send("ok");
-  next();
-});
-
-app.get("/", (req,res)=> res.type("text/plain").send("YOPO Render Engine OK"));
-app.get("/ping", (req,res)=> res.type("text/plain").send("pong"));
 
 // ----- TTL (초)
 const TTL = {
   cgGlobal: 60,
   cgMarkets: 60,
   binanceKline: 10,
-  binanceTicker24: 3,
 };
 
 // ----- 간단 메모리 캐시 (Render Free에서도 동작)
 const mem = new Map(); // key -> { exp:number, status:number, headers:object, body:Buffer }
 
 function nowMs(){ return Date.now(); }
-
-async function fetchUpstream(url){
-  const ctrl = new AbortController();
-  const t = setTimeout(()=>ctrl.abort(), 15000);
-  try{
-    const r = await fetch(url, {
-      method:"GET",
-      headers:{
-        "user-agent":"YOPO-Render-Engine",
-        "accept":"*/*",
-      },
-      signal: ctrl.signal
-    });
-    const buf = Buffer.from(await r.arrayBuffer());
-    const headers = {};
-    for(const [k,v] of r.headers.entries()){
-      headers[k.toLowerCase()] = v;
-    }
-    return { ok:r.ok, status:r.status, headers, body:buf };
-  } finally {
-    clearTimeout(t);
-  }
+function okCors(res){
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "GET,OPTIONS");
+  res.setHeader("access-control-allow-headers", "*");
 }
+
+app.use((req,res,next)=>{
+  okCors(res);
+  if(req.method === "OPTIONS") return res.status(200).send("ok");
+  next();
+});
+
+app.get("/", (req,res)=>{
+  res.type("text/plain").send("YOPO API Cache OK");
+});
+
+app.get("/ping", (req,res)=>{
+  res.json({ ok:true, ts: Date.now() });
+});
 
 async function fetchAndCache(key, upstreamUrl, ttlSec){
   const hit = mem.get(key);
-  if(hit && hit.exp > nowMs()) return hit;
-
-  const r = await fetchUpstream(upstreamUrl);
-
-  // 실패는 캐시 X
-  if(!r.ok){
-    return {
-      exp: nowMs()+1000,
-      status: r.status,
-      headers: Object.assign({}, r.headers, { "access-control-allow-origin":"*" }),
-      body: r.body
-    };
+  if(hit && hit.exp > nowMs()){
+    return hit;
   }
 
-  const out = {
-    exp: nowMs() + ttlSec*1000,
-    status: r.status,
-    headers: Object.assign({}, r.headers, {
-      "cache-control": `public, max-age=${ttlSec}`,
-      "access-control-allow-origin":"*",
-      "content-type": r.headers["content-type"] || "application/json; charset=utf-8"
-    }),
-    body: r.body
-  };
-  mem.set(key, out);
+  const r = await fetch(upstreamUrl, {
+    method: "GET",
+    headers: {
+      "user-agent": "YOPO-Render-Cache",
+      "accept": "*/*",
+    },
+  });
+
+  const buf = Buffer.from(await r.arrayBuffer());
+  const headers = {};
+  r.headers.forEach((v,k)=>{ headers[k.toLowerCase()] = v; });
+
+  const out = { exp: nowMs() + ttlSec*1000, status: r.status, headers, body: buf };
+  // 성공만 캐시 (실패는 캐시 안 함)
+  if(r.ok) mem.set(key, out);
   return out;
 }
 
-function sendCached(res, pack){
-  for(const [k,v] of Object.entries(pack.headers || {})){
-    try{ res.setHeader(k, v); }catch(e){}
-  }
-  res.status(pack.status || 200).send(pack.body);
+function sendCached(res, c){
+  // content-type 유지 (없으면 json 추정 X, 그대로)
+  if(c.headers?.["content-type"]) res.setHeader("content-type", c.headers["content-type"]);
+  res.setHeader("cache-control", "public, max-age=0");
+  okCors(res);
+  res.status(c.status).send(c.body);
 }
 
-// ---------- Proxy/cache routes
+/** CoinGecko: global */
 app.get("/api/cg/global", async (req,res)=>{
-  const key = "cg:global";
-  const upstream = "https://api.coingecko.com/api/v3/global";
-  const pack = await fetchAndCache(key, upstream, TTL.cgGlobal);
-  sendCached(res, pack);
+  try{
+    const upstream = "https://api.coingecko.com/api/v3/global";
+    const key = "cg:global";
+    const c = await fetchAndCache(key, upstream, TTL.cgGlobal);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
+/** CoinGecko: markets (쿼리 그대로 전달) */
 app.get("/api/cg/markets", async (req,res)=>{
-  const key = "cg:markets:" + (req.originalUrl || "");
-  const upstream = "https://api.coingecko.com/api/v3/coins/markets" + (req.url.replace("/api/cg/markets","") || "");
-  const pack = await fetchAndCache(key, upstream, TTL.cgMarkets);
-  sendCached(res, pack);
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://api.coingecko.com/api/v3/coins/markets" + (qs ? ("?"+qs) : "");
+    const key = "cg:markets:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.cgMarkets);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
+/** Binance Vision: futures klines */
 app.get("/api/binance/fapi/klines", async (req,res)=>{
-  const key = "bz:fapi:klines:" + (req.originalUrl || "");
-  const upstream = "https://data-api.binance.vision/fapi/v1/klines" + (req.url.replace("/api/binance/fapi/klines","") || "");
-  const pack = await fetchAndCache(key, upstream, TTL.binanceKline);
-  sendCached(res, pack);
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://data-api.binance.vision/fapi/v1/klines" + (qs ? ("?"+qs) : "");
+    const key = "bn:fut:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.binanceKline);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-app.get("/api/binance/spot/klines", async (req,res)=>{
-  const key = "bz:spot:klines:" + (req.originalUrl || "");
-  const upstream = "https://data-api.binance.vision/api/v3/klines" + (req.url.replace("/api/binance/spot/klines","") || "");
-  const pack = await fetchAndCache(key, upstream, TTL.binanceKline);
-  sendCached(res, pack);
-});
 
+/** Binance Vision: futures ticker 24hr (for TOP20 universe) */
 app.get("/api/binance/fapi/ticker24hr", async (req,res)=>{
-  const key = "bz:fapi:ticker24";
-  const upstream = "https://data-api.binance.vision/fapi/v1/ticker/24hr";
-  const pack = await fetchAndCache(key, upstream, TTL.binanceTicker24);
-  sendCached(res, pack);
+  try{
+    const upstream = "https://data-api.binance.vision/fapi/v1/ticker/24hr";
+    const key = "bn:fut:ticker24hr";
+    const c = await fetchAndCache(key, upstream, 2);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
 });
 
-// ==========================================================
-// ✅ SERVER ENGINE: load client algorithms in VM (no rewrite)
-// - algo_core.js    : app.core.js 복사본
-// - algo_features.js: app.features.js 복사본 (backtest helpers 포함)
-// ==========================================================
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
-
-function loadAlgoContext(){
-  const corePath = path.join(__dirname, "algo_core.js");
-  const featPath = path.join(__dirname, "algo_features.js");
-
-  const coreCode = fs.readFileSync(corePath, "utf-8");
-  const featCode = fs.readFileSync(featPath, "utf-8");
-
-  // 최소 스텁(로드 시 크래시 방지)
-  const dummyEl = ()=>({
-    style:{},
-    classList:{ add(){}, remove(){}, contains(){ return false; } },
-    innerHTML:"",
-    textContent:"",
-    disabled:false,
-    value:"",
-    focus(){},
-    appendChild(){},
-    querySelector(){ return null; },
-  });
-
-  const ctx = {
-    console,
-    Math,
-    Date,
-    setTimeout,
-    clearTimeout,
-    setInterval,
-    clearInterval,
-    Buffer,
-    // browser stubs
-    window: {},
-    document: {
-      getElementById(){ return dummyEl(); },
-      createElement(){ return dummyEl(); },
-      body: dummyEl()
-    },
-    localStorage: {
-      getItem(){ return null; },
-      setItem(){},
-      removeItem(){},
-    },
-    // prevent accidental network calls from loaded code
-    fetch: undefined,
-  };
-
-  const context = vm.createContext(ctx);
-
-  // load core + features into same context
-  vm.runInContext(coreCode, context, { timeout: 1000 });
-  vm.runInContext(featCode, context, { timeout: 1000 });
-
-  // expose needed functions (guard)
-  const need = [
-    "getMTFSet6",
-    "getMTFSet2",
-    "buildSignalFromCandles_MTF",
-    "isPatternBlockedHold",
-    "computeScanScore",
-    "shiftPosEntryTo",
-    "simulateOutcome",
-    "SIM_WINDOW",
-    "FUTURE_H",
-    "EXTENDED_LIMIT",
-    "BACKTEST_TRADES",
-    "BT_MIN_PROB",
-    "BT_MIN_EDGE",
-    "BT_MIN_SIM",
-    "FEE_PCT"
-  ];
-  for(const k of need){
-    if(!(k in context)){
-      throw new Error("ALGO_MISSING_" + k);
-    }
-  }
-  return context;
-}
-
-let ALGO = null;
-try{
-  ALGO = loadAlgoContext();
-  console.log("[ALGO] loaded OK");
-}catch(e){
-  console.error("[ALGO] load failed:", e);
-  // 서버는 살아있되, 엔진 라우트는 에러로 응답하게 처리
-}
-
-function parseKlines(raw){
-  if(!Array.isArray(raw)) return [];
-  return raw.map(k=>({
-    t: Number(k?.[0]),
-    o: Number(k?.[1]),
-    h: Number(k?.[2]),
-    l: Number(k?.[3]),
-    c: Number(k?.[4]),
-    v: Number(k?.[5])
-  })).filter(x=>Number.isFinite(x.t) && Number.isFinite(x.c));
-}
-
-function tfToBinanceInterval(tf){
-  if(tf==="15") return "15m";
-  if(tf==="30") return "30m";
-  if(tf==="60") return "1h";
-  if(tf==="240") return "4h";
-  if(tf==="D") return "1d";
-  if(tf==="W") return "1w";
-  return "1h";
-}
-
-async function fetchCandlesVisionFapi(symbol, tfRaw, limit){
-  const interval = tfToBinanceInterval(String(tfRaw));
-  const url = `https://data-api.binance.vision/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(String(limit||500))}`;
-  const key = `eng:kl:${symbol}:${tfRaw}:${limit}`;
-  const pack = await fetchAndCache(key, url, TTL.binanceKline);
-  if((pack.status||0) >= 400) throw new Error("KLINES_"+pack.status);
-  const raw = JSON.parse(pack.body.toString("utf-8"));
-  return parseKlines(raw);
-}
-
-// 간단 동시성 제한
-async function mapLimit(list, limit, fn){
-  const out = [];
-  let i = 0;
-  const workers = new Array(Math.max(1,limit)).fill(0).map(async ()=>{
-    while(i < list.length){
-      const idx = i++;
-      out[idx] = await fn(list[idx], idx);
-    }
-  });
-  await Promise.all(workers);
-  return out;
-}
-
-// ==========================================================
-// ✅ Engine routes
-// ==========================================================
-app.post("/api/scan", async (req,res)=>{
+/** Binance Vision: futures exchangeInfo (symbol filters) */
+app.get("/api/binance/fapi/exchangeInfo", async (req,res)=>{
   try{
-    if(!ALGO) return res.status(500).json({ error:"ALGO_NOT_READY" });
+    const upstream = "https://data-api.binance.vision/fapi/v1/exchangeInfo";
+    const key = "bn:fut:exchangeInfo";
+    const c = await fetchAndCache(key, upstream, 60);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
+});
 
+/** Binance Vision: futures klines BULK
+ * body: { symbols:[...], interval:"1h", limit:500 }
+ */
+app.post("/api/binance/fapi/klines/bulk", async (req,res)=>{
+  try{
     const symbols = Array.isArray(req.body?.symbols) ? req.body.symbols : [];
-    if(!symbols.length) return res.status(400).json({ error:"MISSING_SYMBOLS" });
+    const interval = String(req.body?.interval || "1h");
+    const limit = String(req.body?.limit || "500");
+    if(!symbols.length) return res.status(400).json({ ok:false, error:"Missing symbols[]" });
 
-    const tfSet = ALGO.getMTFSet6();
-
-    // 각 심볼별 스캔
-    const fullList = await mapLimit(symbols, 2, async (sym)=>{
-      const s = String(sym||"").toUpperCase();
-      const candlesByTf = {};
-      // tf별 캔들 확보(서버는 병렬로 조금만)
-      await mapLimit(tfSet, 2, async (tfRaw)=>{
-        candlesByTf[tfRaw] = await fetchCandlesVisionFapi(s, tfRaw, 380);
-      });
-
-      const out = {};
-      for(const baseTfRaw of tfSet){
-        const baseCandles = candlesByTf[baseTfRaw] || [];
-        if(baseCandles.length < (ALGO.SIM_WINDOW + ALGO.FUTURE_H + 80)){
-          out[baseTfRaw] = null;
-          continue;
-        }
-        try{
-          out[baseTfRaw] = ALGO.buildSignalFromCandles_MTF(s, baseTfRaw, candlesByTf, "6TF");
-        }catch(e){
-          out[baseTfRaw] = null;
-        }
-      }
-
-      // BEST 선택(클라이언트 로직 그대로)
-      let best = null;
-      for(const tfRaw of tfSet){
-        const pos = out[tfRaw];
-        if(!pos) continue;
-
-        const riskHold = ALGO.isPatternBlockedHold(pos);
-        const ex = pos.explain || {};
-        const inferredType = (Number(ex.longP ?? 0.5) >= Number(ex.shortP ?? 0.5)) ? "LONG" : "SHORT";
-
-        const item = {
-          symbol: pos.symbol,
-          tf: pos.tf,
-          tfRaw: pos.tfRaw,
-          type: (pos.type === "HOLD") ? inferredType : pos.type,
-          winProb: Number(ex.winProb ?? 0.5),
-          edge: Number(ex.edge ?? 0),
-          mtfAgree: ex?.mtf?.agree ?? 1,
-          mtfVotes: (ex?.mtf?.votes || []).join("/"),
-          confTier: ex?.conf?.tier ?? "-",
-          isRisk: !!riskHold,
-          multi: true
-        };
-
-        if(pos.type === "HOLD" && !riskHold) continue;
-
-        item._score = ALGO.computeScanScore(item);
-        if(!best || item._score > best._score) best = item;
-      }
-
-      if(best){
-        return {
-          symbol: best.symbol,
-          bestTf: best.tf,
-          bestTfRaw: best.tfRaw,
-          bestType: best.type,
-          winProb: best.winProb,
-          edge: best.edge,
-          mtfAgree: best.mtfAgree,
-          mtfVotes: best.mtfVotes,
-          confTier: best.confTier,
-          isRisk: best.isRisk
-        };
-      }
-      return {
-        symbol: s,
-        bestTf: "-",
-        bestTfRaw: "-",
-        bestType: "HOLD",
-        winProb: 0.5,
-        edge: 0,
-        mtfAgree: 0,
-        mtfVotes: "",
-        confTier: "-",
-        isRisk: false
-      };
-    });
-
-    // 추천 TOP: bestType!=HOLD 또는 isRisk==true만 모아 점수로 정렬
-    const top = fullList
-      .filter(x => x && (x.bestType !== "HOLD" || x.isRisk))
-      .map(x => ({
-        symbol: x.symbol,
-        tf: x.bestTf,
-        tfRaw: x.bestTfRaw,
-        type: x.bestType,
-        winProb: x.winProb,
-        edge: x.edge,
-        mtfAgree: x.mtfAgree,
-        mtfVotes: x.mtfVotes,
-        confTier: x.confTier,
-        isRisk: x.isRisk,
-        multi: true
-      }))
-      .sort((a,b)=>{
-        const sa = ALGO.computeScanScore(Object.assign({_score:0}, a));
-        const sb = ALGO.computeScanScore(Object.assign({_score:0}, b));
-        return sb - sa;
-      })
-      .slice(0, 12);
-
-    res.json({ top, fullList });
-  }catch(e){
-    console.error("SCAN_ERR", e);
-    res.status(500).json({ error:"SCAN_ERR", message: String(e?.message||e) });
-  }
-});
-
-app.post("/api/predict", async (req,res)=>{
-  try{
-    if(!ALGO) return res.status(500).json({ error:"ALGO_NOT_READY" });
-
-    const symbol = String(req.body?.symbol || "").toUpperCase();
-    if(!symbol) return res.status(400).json({ error:"MISSING_SYMBOL" });
-
-    const tfSet = ALGO.getMTFSet6();
-    const candlesByTf = {};
-    await mapLimit(tfSet, 2, async (tfRaw)=>{
-      candlesByTf[tfRaw] = await fetchCandlesVisionFapi(symbol, tfRaw, ALGO.EXTENDED_LIMIT);
-    });
-
+    const maxConc = 5;
     const out = {};
-    for(const baseTfRaw of tfSet){
-      const baseCandles = candlesByTf[baseTfRaw] || [];
-      if(baseCandles.length < (ALGO.SIM_WINDOW + ALGO.FUTURE_H + 80)){
-        out[baseTfRaw] = null;
-        continue;
-      }
-      try{
-        out[baseTfRaw] = ALGO.buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, "6TF");
-      }catch(e){
-        out[baseTfRaw] = null;
-      }
-    }
+    let idx = 0;
 
-    res.json({ out });
-  }catch(e){
-    console.error("PRED_ERR", e);
-    res.status(500).json({ error:"PRED_ERR", message: String(e?.message||e) });
-  }
-});
-
-app.post("/api/backtest", async (req,res)=>{
-  try{
-    if(!ALGO) return res.status(500).json({ error:"ALGO_NOT_READY" });
-
-    const symbol = String(req.body?.symbol || "").toUpperCase();
-    if(!symbol) return res.status(400).json({ error:"MISSING_SYMBOL" });
-
-    // 클라이언트와 동일: 2TF 세트 (base + other)
-    const baseTf = "60"; // 기본은 60 (클라 state.tf가 서버엔 없으니 안전값)
-    const tfSet = ALGO.getMTFSet2(baseTf);
-    const tfA = tfSet[0];
-    const tfB = tfSet[1];
-
-    const candlesA = await fetchCandlesVisionFapi(symbol, tfA, ALGO.EXTENDED_LIMIT);
-    if(candlesA.length < (ALGO.SIM_WINDOW + ALGO.FUTURE_H + 120)){
-      return res.json({ total:0, wins:0, winRate:0, avgPnl:0, rangeText:"캔들 부족" });
-    }
-    const candlesB = await fetchCandlesVisionFapi(symbol, tfB, ALGO.EXTENDED_LIMIT);
-
-    let total=0, wins=0, pnlSum=0;
-    const start = Math.max(ALGO.SIM_WINDOW + 20, 120);
-    const end = candlesA.length - (ALGO.FUTURE_H + 10);
-
-    for(let idx=start; idx<end; idx+=ALGO.SIM_STEP || 2){
-      // slice for MTF
-      const sliceA = candlesA.slice(0, idx+1);
-      const byTf = {};
-      byTf[tfA] = sliceA;
-
-      // align other tf by time
-      const tRef = sliceA[sliceA.length-1]?.t;
-      if(Number.isFinite(tRef) && candlesB.length){
-        const sliceB = candlesB.filter(x=>x.t <= tRef);
-        if(sliceB.length >= (ALGO.SIM_WINDOW + ALGO.FUTURE_H + 80)){
-          byTf[tfB] = sliceB;
+    async function worker(){
+      while(idx < symbols.length){
+        const my = idx++;
+        const sym = String(symbols[my]||"").toUpperCase();
+        if(!sym) continue;
+        const qs = `?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+        const upstream = "https://data-api.binance.vision/fapi/v1/klines" + qs;
+        const key = "bn:fut:kline:" + sym + ":" + interval + ":" + limit;
+        const c = await fetchAndCache(key, upstream, TTL.binanceKline);
+        if(c.status >= 200 && c.status < 300){
+          try{ out[sym] = JSON.parse(c.body.toString("utf-8")); }
+          catch(e){ out[sym] = null; }
+        }else{
+          out[sym] = null;
         }
       }
-
-      let pos = null;
-      try{
-        pos = ALGO.buildSignalFromCandles_MTF(symbol, tfA, byTf, "2TF");
-      }catch(e){
-        continue;
-      }
-      if(!pos || pos.type === "HOLD") continue;
-
-      const ex = pos.explain || {};
-      if((ex.winProb ?? 0) < ALGO.BT_MIN_PROB) continue;
-      if((ex.edge ?? 0) < ALGO.BT_MIN_EDGE) continue;
-      if((ex.simAvg ?? 0) < ALGO.BT_MIN_SIM) continue;
-
-      // 엔트리 시프트
-      const entryCandle = candlesA[idx+1];
-      if(!entryCandle || !Number.isFinite(entryCandle.o)) continue;
-      try{ ALGO.shiftPosEntryTo(pos, entryCandle.o); }catch(e){}
-
-      const future = candlesA.slice(idx+1, Math.min(idx+1+140, candlesA.length));
-      const outcome = ALGO.simulateOutcome(pos, future);
-      if(!outcome?.resolved) continue;
-
-      total++;
-      if(outcome.win) wins++;
-      pnlSum += (outcome.pnlPct || 0);
-
-      if(total >= ALGO.BACKTEST_TRADES) break;
     }
 
-    const winRate = total ? (wins/total)*100 : 0;
-    const avgPnl = total ? (pnlSum/total) : 0;
+    const workers = [];
+    for(let i=0;i<Math.min(maxConc, symbols.length);i++) workers.push(worker());
+    await Promise.all(workers);
 
-    res.json({
-      total,
-      wins,
-      winRate,
-      avgPnl,
-      rangeText: `${tfA} / ${tfB}`
-    });
+    return res.json({ ok:true, interval, limit:Number(limit), data: out });
   }catch(e){
-    console.error("BT_ERR", e);
-    res.status(500).json({ error:"BT_ERR", message: String(e?.message||e) });
+    return res.status(500).json({ ok:false, error:"server error: "+(e?.message||String(e)) });
   }
 });
 
-app.listen(PORT, ()=> console.log(`YOPO Render Engine listening on :${PORT}`));
+/** Binance Vision: spot klines */
+app.get("/api/binance/spot/klines", async (req,res)=>{
+  try{
+    const qs = req.originalUrl.includes("?") ? req.originalUrl.split("?")[1] : "";
+    const upstream = "https://data-api.binance.vision/api/v3/klines" + (qs ? ("?"+qs) : "");
+    const key = "bn:spot:" + (qs || "default");
+    const c = await fetchAndCache(key, upstream, TTL.binanceKline);
+    return sendCached(res, c);
+  }catch(e){
+    return res.status(500).type("text/plain").send("server error: "+(e?.message||String(e)));
+  }
+});
+
+app.listen(PORT, ()=>{
+  console.log("Listening on", PORT);
+});
