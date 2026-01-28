@@ -1924,6 +1924,8 @@ async function fetchJSON(url, opt={}){
 /* =========================
    Core bootstrap (가벼운 초기화)
 ========================= */
+// Core bootstrap (browser only)
+if(typeof window !== "undefined" && typeof document !== "undefined"){
 (function coreBoot(){
   try{
     ensureCoreStateShape();
@@ -1947,6 +1949,8 @@ async function fetchJSON(url, opt={}){
 })();
 
 
+
+}
 function getMTFSet6(){ return ['15','30','60','240','D','W']; }
 
 function consensusMultiTF(cores, order){
@@ -2001,3 +2005,18 @@ function consensusMultiTF(cores, order){
 const MIN_CANDLES_FOR_SIGNAL = 50; // safety guard  // ✅ 유니버스는 항상 30종으로 정규화
   state.universe = normalizeUniverse(state.universe);
 
+
+
+/* ==========================================================
+   SERVER ENGINE EXPORTS
+   ========================================================== */
+export { buildSignalFromCandles_MTF, getMTFSet6 };
+
+// Also expose on globalThis (both browser/server)
+try{
+  const g = (typeof globalThis !== "undefined") ? globalThis : null;
+  if(g){
+    if(typeof buildSignalFromCandles_MTF === "function") g.buildSignalFromCandles_MTF = buildSignalFromCandles_MTF;
+    if(typeof getMTFSet6 === "function") g.getMTFSet6 = getMTFSet6;
+  }
+}catch(e){}
