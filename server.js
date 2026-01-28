@@ -18,6 +18,10 @@
  */
 
 import express from "express";
+import fs from "fs/promises";
+import vm from "vm";
+import { fileURLToPath } from "url";
+import path from "path";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -298,24 +302,47 @@ async function _fetchPack6(symbol, limitBase=380){
 let __algoCache = null;
 let __algoCacheAt = 0;
 
+function _absPath(rel){
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.join(__dirname, rel);
+}
+
 async function loadAlgoCore(){
   const now = Date.now();
   if(__algoCache && (now - __algoCacheAt) < 10_000) return __algoCache;
 
+  // 1) ESM export 방식
   try{
     const core = await import("./algo_core.js");
     const buildSignalFromCandles_MTF = core?.buildSignalFromCandles_MTF;
     const getMTFSet6 = core?.getMTFSet6;
-
-    if(typeof buildSignalFromCandles_MTF !== "function"){
-      __algoCache = null;
+    if(typeof buildSignalFromCandles_MTF === "function"){
+      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6 };
       __algoCacheAt = now;
-      return null;
+      return __algoCache;
     }
+  }catch(e){
+    // ignore → fallback
+  }
 
-    __algoCache = { buildSignalFromCandles_MTF, getMTFSet6 };
+  // 2) ✅ VM 방식 (브라우저 스크립트 호환)
+  try{
+    const code = await fs.readFile(_absPath("./algo_core.js"), "utf-8");
+    const ctx = vm.createContext({ console, Math, Date, setTimeout, clearTimeout, setInterval, clearInterval });
+    vm.runInContext(code, ctx, { timeout: 1000 });
+
+    const buildSignalFromCandles_MTF = ctx.buildSignalFromCandles_MTF;
+    const getMTFSet6 = ctx.getMTFSet6;
+
+    if(typeof buildSignalFromCandles_MTF === "function"){
+      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6 };
+      __algoCacheAt = now;
+      return __algoCache;
+    }
+    __algoCache = null;
     __algoCacheAt = now;
-    return __algoCache;
+    return null;
   }catch(e){
     __algoCache = null;
     __algoCacheAt = now;
@@ -442,6 +469,140 @@ app.post("/api/engine/backtest", async (req,res)=>{
   return engineNotReady(res, "backtest engine not wired yet");
 });
 
+
+/**
+ * POST /api/engine/backtest
+ * body: { universe:[...], limitBase?:900, tradesPerTf?:80 }
+ * return: { ok:true, rows:[...], meta:{...} }
+ */
+app.post("/api/engine/backtest", async (req,res)=>{
+  try{
+    const algo = await loadAlgoCore();
+    if(!algo) return engineNotReady(res, "algo_core load failed (need buildSignalFromCandles_MTF)");
+
+    const { buildSignalFromCandles_MTF, getMTFSet6 } = algo;
+
+    const symbols = _universeToSymbols(req.body?.universe);
+    if(!symbols.length) return res.status(400).json({ ok:false, error:"Missing universe[]" });
+
+    const tfs = (typeof getMTFSet6 === "function") ? getMTFSet6() : ["15","30","60","240","D","W"];
+    const limitBase = Math.max(220, Math.min(1200, Number(req.body?.limitBase ?? 900)));
+    const tradesPerTf = Math.max(10, Math.min(120, Number(req.body?.tradesPerTf ?? 80)));
+
+    const horizonByTf = { "15": 64, "30": 48, "60": 36, "240": 24, "D": 14, "W": 10 };
+    const stepByTf    = { "15": 8,  "30": 6,  "60": 4,  "240": 2,  "D": 1,  "W": 1  };
+
+    function _outcome(pos, futureCandles){
+      if(!pos || pos.type === "HOLD" || !Number.isFinite(pos.tp) || !Number.isFinite(pos.sl)) return null;
+      const isLong = (pos.type === "LONG") || (pos.tp > pos.entry);
+      for(const c of futureCandles){
+        const hi = c.h, lo = c.l;
+        if(isLong){
+          if(hi >= pos.tp) return { win:true };
+          if(lo <= pos.sl) return { win:false };
+        }else{
+          if(lo <= pos.tp) return { win:true };
+          if(hi >= pos.sl) return { win:false };
+        }
+      }
+      return null;
+    }
+
+    function _cutIndex(arr, cutT){
+      let lo=0, hi=arr.length-1, ans=-1;
+      while(lo<=hi){
+        const mid=(lo+hi)>>1;
+        if(arr[mid].t <= cutT){ ans=mid; lo=mid+1; }
+        else hi=mid-1;
+      }
+      return ans;
+    }
+
+    const rows = [];
+    const maxConc = 2;
+    let idx = 0;
+
+    async function worker(){
+      while(idx < symbols.length){
+        const my = idx++;
+        const symbol = symbols[my];
+
+        const candlesByTfFull = await _fetchPack6(symbol, limitBase);
+
+        for(const tfRaw of tfs){
+          const series = candlesByTfFull[tfRaw] || [];
+          if(series.length < 220) continue;
+
+          const horizon = horizonByTf[tfRaw] ?? 36;
+          const step = stepByTf[tfRaw] ?? 4;
+
+          let wins=0, losses=0, skipped=0, samples=0, sumRet=0;
+
+          for(let i = series.length - horizon - 2; i >= 220 && samples < tradesPerTf; i -= step){
+            const cutT = series[i].t;
+
+            const pack = {};
+            for(const tf2 of tfs){
+              const arr = candlesByTfFull[tf2] || [];
+              const ci = _cutIndex(arr, cutT);
+              pack[tf2] = (ci >= 0) ? arr.slice(0, ci+1) : [];
+            }
+
+            if((pack[tfRaw]?.length || 0) < 120) continue;
+
+            let pos = null;
+            try{
+              pos = buildSignalFromCandles_MTF(symbol, tfRaw, pack, "6TF");
+            }catch(e){
+              skipped++; continue;
+            }
+            if(!pos || pos.type === "HOLD"){ skipped++; continue; }
+
+            const future = series.slice(i+1, i+1+horizon);
+            const oc = _outcome(pos, future);
+            if(!oc){ skipped++; continue; }
+
+            const tpPct = Number(pos.tpPct || 0);
+            const slPct = Number(pos.slPct || 0);
+
+            if(oc.win){
+              wins++; samples++;
+              if(Number.isFinite(tpPct) && tpPct>0) sumRet += tpPct;
+            }else{
+              losses++; samples++;
+              if(Number.isFinite(slPct) && slPct>0) sumRet -= slPct;
+            }
+          }
+
+          if(samples <= 0) continue;
+
+          rows.push({
+            symbol,
+            strategy: tfRaw,
+            samples,
+            winRate: wins / samples,
+            avgRet: sumRet / samples,
+            note: `skip:${skipped}`
+          });
+        }
+      }
+    }
+
+    const workers = [];
+    for(let i=0;i<Math.min(maxConc, symbols.length);i++) workers.push(worker());
+    await Promise.all(workers);
+
+    rows.sort((a,b)=> (b.samples - a.samples) || (b.winRate - a.winRate));
+
+    return res.json({
+      ok:true,
+      rows,
+      meta:{ universeSize: symbols.length, tfs, limitBase, tradesPerTf, ts: Date.now() }
+    });
+  }catch(e){
+    return res.status(500).json({ ok:false, error:"server error: "+(e?.message||String(e)) });
+  }
+});
 
 app.listen(PORT, ()=>{
   console.log("Listening on", PORT);

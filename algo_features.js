@@ -1755,113 +1755,6 @@ function shiftPosEntryTo(pos, newEntry){
   return pos;
 }
 
-async function runBacktest(){
-  ensureRuntimeState();
-
-  const opToken = beginOperation("BACKTEST");
-
-  const btBtn = document.getElementById("bt-btn");
-  if(btBtn){
-    btBtn.disabled = true;
-    btBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 백테스트...';
-  }
-
-  const box = document.getElementById("bt-box");
-  if(box) box.classList.remove("show");
-
-  try{
-    checkCanceled(opToken);
-
-    const tfSet = getMTFSet2(state.tf);
-    const baseTf = tfSet[0];
-    const otherTf = tfSet[1];
-
-    const candlesBase = await fetchCandles(state.symbol, baseTf, EXTENDED_LIMIT);
-    if(candlesBase.length < (SIM_WINDOW + FUTURE_H + 120)) throw new Error("캔들 데이터가 부족합니다.");
-
-    let candlesOther = null;
-    try{
-      candlesOther = await fetchCandles(state.symbol, otherTf, EXTENDED_LIMIT);
-    }catch(e){}
-
-    let wins=0, total=0;
-    let pnlSum=0;
-
-    const end = candlesBase.length - (FUTURE_H + 20);
-    const start = Math.max(SIM_WINDOW + 80, end - (BACKTEST_TRADES * 7));
-
-    for(let idx = start; idx < end; idx += 7){
-      checkCanceled(opToken);
-
-      const sliceBase = candlesBase.slice(0, idx+1);
-      if(sliceBase.length < (SIM_WINDOW + FUTURE_H + 80)) continue;
-
-      const byTf = { [baseTf]: sliceBase };
-
-      if(Array.isArray(candlesOther) && candlesOther.length > 120){
-        const tRef = sliceBase[sliceBase.length-1].t;
-        const sliceOther = sliceCandlesUpToTime(candlesOther, tRef);
-        if(sliceOther.length >= (SIM_WINDOW + FUTURE_H + 80)){
-          byTf[otherTf] = sliceOther;
-        }
-      }
-
-      const pos = buildSignalFromCandles_MTF(state.symbol, baseTf, byTf, "2TF");
-      if(pos.type === "HOLD") continue;
-
-      const ex = pos.explain || {};
-      if((ex.winProb ?? 0) < BT_MIN_PROB) continue;
-      if((ex.edge ?? 0) < BT_MIN_EDGE) continue;
-      if((ex.simAvg ?? 0) < BT_MIN_SIM) continue;
-
-      const entryCandle = candlesBase[idx+1];
-      if(!entryCandle || !Number.isFinite(entryCandle.o)) continue;
-      shiftPosEntryTo(pos, entryCandle.o);
-
-      const future = candlesBase.slice(idx+1, Math.min(idx+1+140, candlesBase.length));
-      const outcome = simulateOutcome(pos, future);
-      if(!outcome.resolved) continue;
-
-      total++;
-      if(outcome.win) wins++;
-      pnlSum += outcome.pnlPct;
-
-      if(total >= BACKTEST_TRADES) break;
-    }
-
-    const winRate = total ? (wins/total)*100 : 0;
-    const avgPnl = total ? (pnlSum/total) : 0;
-
-    const nEl = document.getElementById("bt-n");
-    const wEl = document.getElementById("bt-win");
-    const aEl = document.getElementById("bt-avg");
-    const rEl = document.getElementById("bt-range");
-    if(nEl) nEl.textContent = `${total}회`;
-    if(wEl) wEl.textContent = `${winRate.toFixed(1)}%`;
-    if(aEl) aEl.textContent = `${avgPnl.toFixed(2)}%`;
-
-    const tfNameShow = baseTf === "60" ? "1H" : baseTf === "240" ? "4H" : "1D";
-    if(rEl){
-      rEl.textContent =
-        `${state.symbol} · ${tfNameShow} · 최근 ${EXTENDED_LIMIT}캔들 (필터: 확률≥${Math.round(BT_MIN_PROB*100)}%, 엣지≥${Math.round(BT_MIN_EDGE*100)}%, 유사도≥${BT_MIN_SIM}%) · MTF(2TF) · ✅otherTF누수방지 · ✅다음시가진입 · ✅동봉캔들보수판정 · 비용 -${FEE_PCT.toFixed(2)}% 반영`;
-    }
-
-    if(box) box.classList.add("show");
-  }catch(e){
-    if(String(e?.message || "").includes("CANCELLED")){
-      toast("백테스트가 취소되었습니다.", "warn");
-      return;
-    }
-    console.error(e);
-    toast("백테스트 중 오류가 발생했습니다.", "danger");
-  }finally{
-    endOperation(opToken);
-    if(btBtn){
-      btBtn.disabled = false;
-      btBtn.innerHTML = '<i class="fa-solid fa-flask"></i> 백테스트';
-    }
-  }
-}
 
 function simulateOutcome(pos, futureCandles){
   for(const c of futureCandles){
@@ -1925,7 +1818,7 @@ window.closeScanListModal = closeScanListModal;
 window.openFromScanListOrSidebar = openFromScanListOrSidebar;
 
 // 백테스트/모달
-window.runBacktest = runBacktest;
+// window.runBacktest 바인딩은 파일 하단 FINAL BINDINGS에서 강제합니다.
 window.openBacktestModal = openBacktestModal;
 window.closeBacktestModal = closeBacktestModal;
 window.confirmTrack = confirmTrack;
