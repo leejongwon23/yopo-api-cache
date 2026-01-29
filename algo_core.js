@@ -2217,3 +2217,5 @@ function consensusMultiTF(cores, order){
 const MIN_CANDLES_FOR_SIGNAL = 50; // safety guard  // ✅ 유니버스는 항상 30종으로 정규화
   state.universe = normalizeUniverse(state.universe);
 
+// ===== ESM exports for Render server =====
+export { buildSignalFromCandles_MTF, buildSignalFromCandles };
