@@ -315,6 +315,7 @@ const META_MIN_SAMPLES = 12;      // 이 이상부터 의미있게 반영
 const META_PRIOR_N = 18;          // 베이지안 완충(초기 흔들림 방지)
 const META_PRIOR_WR = 0.55;       // 초기 기대 승률
 const META_ALPHA_MAX = 0.18;      // winProb 보정 최대치(과대반영 방지)
+const META_HALF_LIFE_MS = 1000*60*60*24*14; // 14일 반감기(최근 가중)
 
 function ensureMetaBrain(){
   if(!state.metaBrain || typeof state.metaBrain !== "object"){
@@ -355,6 +356,13 @@ function buildMetaKey(symbol, tfRaw, type, regime, ex){
 }
 
 function metaGetStats(key){
+  // server-side: evolve 엔진(Map) 우선
+  try{
+    if(typeof __metaBrain !== "undefined" && __metaBrain && __metaBrain.get){
+      const s = __metaBrain.get(key);
+      if(s) return s;
+    }
+  }catch(e){}
   ensureMetaBrain();
   return state.metaBrain.stats[key] || null;
 }
@@ -370,9 +378,30 @@ function metaGetWinRate(key){
   return { wr, n, w };
 }
 
-function metaUpdate(key, win){
+function metaUpdate(key, win, ts){
   ensureMetaBrain();
   if(!key) return;
+  const now = Number.isFinite(Number(ts)) ? Number(ts) : Date.now();
+
+  // 1) Map(metaBrain) 업데이트(최근 가중: 지수감쇠)
+  try{
+    if(typeof __metaBrain !== "undefined" && __metaBrain){
+      const cur = __metaBrain.get(key) || { n:0, w:0, lastTs:0 };
+      const last = Number(cur.lastTs||0);
+      if(last > 0 && now > last){
+        const dt = now - last;
+        const k = Math.exp(-dt / Math.max(1, META_HALF_LIFE_MS));
+        cur.n *= k;
+        cur.w *= k;
+      }
+      cur.n += 1;
+      if(win) cur.w += 1;
+      cur.lastTs = now;
+      __metaBrain.set(key, cur);
+    }
+  }catch(e){}
+
+  // 2) (호환) state.metaBrain에도 미러링(브라우저/로컬 테스트용)
   const s = state.metaBrain.stats[key] || { n: 0, w: 0 };
   s.n += 1;
   if(win) s.w += 1;
@@ -384,12 +413,12 @@ function metaUpdate(key, win){
 function metaRecordFromPosition(pos, win, reason){
   try{
     const ex = pos?.explain || {};
-    const key = ex?.metaKey || null;
+    const key = ex?.evolveKey || ex?.metaKey || null;
     if(!key) return;
     // 성공 정의(B): TP가 먼저 닿으면 성공, SL이 먼저 닿으면 실패
     // TIME 종료는 '불완전'이라 메타 학습에 약하게만 반영(또는 제외)
     if(reason === "TP" || reason === "SL"){
-      metaUpdate(key, !!win);
+      metaUpdate(key, !!win, pos?.closedAt || Date.now());
     }else{
       // TIME 기반은 너무 noisy: 0.35 가중치로만 반영(정수만 저장되므로 1회 중 1회만 반영)
       // 간단히: TIME은 기록하지 않음(안전)
@@ -410,7 +439,7 @@ function evolveApplyFeedback(feedback){
   try{
     if(!feedback || typeof feedback !== "object") return false;
     const win = !!feedback.win;
-    const metaKey = (typeof feedback.metaKey === "string" && feedback.metaKey) ? feedback.metaKey : null;
+    const metaKey = (typeof feedback.evolveKey === "string" && feedback.evolveKey) ? feedback.evolveKey : ((typeof feedback.metaKey === "string" && feedback.metaKey) ? feedback.metaKey : null);
     if(metaKey) metaUpdate(metaKey, win);
     return true;
   }catch(e){
@@ -879,6 +908,42 @@ function calcSimilarityStatsEnsemble(closes, winLen, futureH, step, topK){
 /* =========================
    Signal core (지표/유사도/합의)
 ========================= */
+
+function calcRangePos(highs, lows, closes, lookback=50){
+  const n = closes.length;
+  if(n < 5) return null;
+  const start = Math.max(0, n - lookback);
+  let hi = -Infinity, lo = Infinity;
+  for(let i=start;i<n;i++){
+    const h = Number(highs[i]); const l = Number(lows[i]);
+    if(Number.isFinite(h) && h > hi) hi = h;
+    if(Number.isFinite(l) && l < lo) lo = l;
+  }
+  const span = hi - lo;
+  if(!Number.isFinite(span) || span <= 0) return null;
+  const p = Number(closes[n-1]);
+  return clamp((p - lo) / span, 0, 1);
+}
+
+function calcDirFlip(closes, lookback=14){
+  const n = closes.length;
+  if(n < lookback+2) return 0;
+  const start = n - lookback - 1;
+  let lastSign = 0;
+  let flips = 0;
+  let steps = 0;
+  for(let i=start+1;i<n;i++){
+    const d = Number(closes[i]) - Number(closes[i-1]);
+    const s = (d > 0) ? 1 : (d < 0) ? -1 : 0;
+    if(s === 0) continue;
+    if(lastSign !== 0 && s !== lastSign) flips += 1;
+    lastSign = s;
+    steps += 1;
+  }
+  if(steps <= 1) return 0;
+  return clamp(flips / Math.max(1, steps-1), 0, 1);
+}
+
 function computeSignalCore(symbol, tfRaw, candles){
   const closes = candles.map(x => x.c);
   const highs  = candles.map(x => x.h);
@@ -909,6 +974,10 @@ function computeSignalCore(symbol, tfRaw, candles){
 
   const trendStrength = (atrRaw > 0) ? (Math.abs(ema20 - ema50) / atrRaw) : 0;
   const atrPct = (entry > 0) ? ((atrRaw / entry) * 100) : 0;
+
+  const rangePos = calcRangePos(highs, lows, closes, 60);
+  const dirFlip = calcDirFlip(closes, 14);
+  const regime = classifyRegime6(trend, trendStrength, atrPct, adx, bbWidth, atrChg, volSpike, rangePos, dirFlip);
 
   const sim = (typeof calcSimilarityStatsEnsemble === 'function')
     ? calcSimilarityStatsEnsemble(closes, SIM_WINDOW, FUTURE_H, SIM_STEP, SIM_TOPK)
@@ -984,6 +1053,9 @@ function computeSignalCore(symbol, tfRaw, candles){
     ema50,
     trend,
     trendStrength,
+    regime,
+    rangePos,
+    dirFlip,
     adx,
     plusDI,
     minusDI,
@@ -1165,9 +1237,10 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
     }
   }
 
-  const type = con.type;
-
-  const winProbRaw = con.winProb;
+  
+function __finalizeCandidate(type){
+  // (EV 선택을 위해) 방향별 후보를 따로 평가
+  const winProbRaw = (type === "LONG") ? con.longP : con.shortP;
   let winProbAdj = winProbRaw;
   let edgeAdj = con.edge;
 
@@ -1185,8 +1258,8 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
     // 합의가 너무 낮으면(충돌) 약간 패널티
     if(agreeN <= 2) winProbAdj = clamp(winProbAdj - 0.012, 0.50, 0.99);
   }
-  const regime = classifyRegime(base.trendStrength, base.atrPct);
-  const regAdj = applyRegimeAdjustment(winProbAdj, edgeAdj, regime, agreeN);
+  const regime = base.regime || classifyRegime6(base.trend, base.trendStrength, base.atrPct, base.adx, base.bbWidth, base.atrChg, base.volSpike, base.rangePos, base.dirFlip);
+  const regAdj = applyRegimeAdjustment(winProbAdj, edgeAdj, regime, agreeN, type, base);
   winProbAdj = regAdj.winProb;
   edgeAdj = regAdj.edge;
 
@@ -1217,6 +1290,11 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
   }
 
   const holdReasons = [];
+  // 레짐 전문가/현실 필터 사유를 HOLD 사유로 연결
+  if(regAdj && Array.isArray(regAdj.holdReasons) && regAdj.holdReasons.length){
+    for(const r of regAdj.holdReasons){ holdReasons.push(`REGIME:${r}`); }
+  }
+  const __hardHoldByRegime = !!(regAdj && regAdj.hardHold);
   const mtfVotes = (con.votes || []).join("/");
 
   const explainBase = {
@@ -1285,6 +1363,10 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
   explainBase.metaKey = metaKey;
 
   const sigForPenalty = buildPatternSignature(symbol, baseTfRaw, type, explainBase);
+  // ✅ 진화키: (레짐×TF×방향×패턴) 단위로 기억
+  const evolveKey = `${metaKey}|p:${sigForPenalty}`;
+  explainBase.patternSig = sigForPenalty;
+  explainBase.evolveKey = evolveKey;
   const avoidMeta = getAvoidMeta(sigForPenalty);
   const pp = computePatternPenalty(avoidMeta);
 
@@ -1294,7 +1376,7 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
   }
   // ✅ v4 META: 비슷한 상황의 과거 성적(메타 브레인)을 winProb에 반영
   try{
-    const mAdj = applyMetaAdjustment(winProbAdj, explainBase.metaKey);
+    const mAdj = applyMetaAdjustment(winProbAdj, explainBase.evolveKey || explainBase.metaKey);
     winProbAdj = mAdj.winProb;
     explainBase.meta = mAdj.meta;
   }catch(e){
@@ -1332,6 +1414,9 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
 
   let tpPct = Math.abs((tp - entry) / entry) * 100;
   let slPct = Math.abs((sl - entry) / entry) * 100;
+
+  // ✅ 기대값(Expectancy) = p*TP - (1-p)*SL (단위: %)
+  explainBase.expectancy = (winProbAdj * tpPct) - ((1 - winProbAdj) * slPct);
 
   if(tpPct > TP_MAX_PCT){
     tpPct = TP_MAX_PCT;
@@ -1399,9 +1484,9 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
     holdReasons.push(`실패패턴 극악(강제 HOLD): n=${avoidMeta.n}, wr ${(avoidMeta.wr*100).toFixed(0)}%`);
   }
 
-  const finalHold = isHoldByBaseRules || hardHold;
+  const finalHold = isHoldByBaseRules || hardHold || __hardHoldByRegime;
 
-  return {
+  const __signal = {
     id: Date.now(),
     symbol,
     tf: tfName(baseTfRaw),
@@ -1416,6 +1501,33 @@ function buildSignalFromCandles_MTF(symbol, baseTfRaw, candlesByTf, mode="3TF"){
     explain: explainBase,
     sig: finalHold ? null : sigForPenalty
   };
+
+  // ✅ 최종 선택 기준: 기대값(Expectancy)
+  const __ev = Number(__signal?.explain?.expectancy);
+  const __evSafe = Number.isFinite(__ev) ? __ev : -999;
+
+  return { signal: __signal, ev: __evSafe, isHold: (__signal.type === "HOLD") };
+}
+
+  const __candLong  = __finalizeCandidate("LONG");
+  const __candShort = __finalizeCandidate("SHORT");
+
+  // ✅ EV 기준 선택(동점이면 원래 합의 방향 우선)
+  let __chosen = __candLong;
+  if(__candShort.ev > __candLong.ev) __chosen = __candShort;
+  else if(__candShort.ev === __candLong.ev){
+    __chosen = (con.type === "SHORT") ? __candShort : __candLong;
+  }
+
+  // ✅ 둘 다 HOLD면 HOLD
+  if(__candLong.isHold && __candShort.isHold){
+    return __candLong.signal;
+  }
+  if(__candLong.isHold && !__candShort.isHold) __chosen = __candShort;
+  if(__candShort.isHold && !__candLong.isHold) __chosen = __candLong;
+
+  return __chosen.signal;
+
 }
 
 function buildSignalFromCandles(symbol, tf, candles){
@@ -1775,44 +1887,149 @@ function clamp(x, a, b){
    - 시장 상태를 단순 분류해서 (추세/횡보/과변동/저변동)
      승률/엣지 보정에 사용한다.
 ========================= */
-function classifyRegime(trendStrength, atrPct){
-  const ts = Number(trendStrength)||0;
-  const ap = Number(atrPct)||0;
+function classifyRegime6(trend, trendStrength, atrPct, adx, bbWidth, atrChg, volSpike, rangePos, dirFlip){
+  // ✅ 완성형 6 레짐 분류
+  // 입력은 computeSignalCore에서 계산한 핵심 요약 피처들
+  const t  = Number(trend)||0;                  // +1(up) / -1(down)
+  const ts = Number(trendStrength)||0;          // 추세강도(ema20-ema50)/ATR
+  const ap = Number(atrPct)||0;                 // ATR% (0~)
+  const a  = Number(adx)||0;                    // ADX (0~)
+  const bw = Number(bbWidth)||0;                // BB width (ratio)
+  const ac = Number(atrChg)||0;                 // ATR 변화율(-1~1 근사)
+  const vs = Number(volSpike)||0;               // 0~1
+  const rp = Number(rangePos);                  // 0~1 (box position)
+  const df = Number(dirFlip)||0;                // 0~1 (방향 급변)
 
-  // ✅ 매우 단순 4분류 (과도한 복잡화 금지)
-  // - TREND: 추세가 확실
-  // - RANGE: 추세 약 + ATR 보통
-  // - VOLATILE: 변동성 과다(휩쏘 위험)
-  // - CALM: 변동성 낮음(수익폭 작음/미세노이즈)
-  if(ts >= 0.55 && ap >= 0.45) return "TREND";
-  if(ap >= 1.25) return "VOLATILE";
-  if(ap <= 0.25) return "CALM";
+  // CHAOS: 변동성/스파이크 크고, 추세/방향이 약하거나 급변이 심함 → HOLD 성향
+  const chaos = (ap >= 1.6) && ((ts < 0.45) || (a < 17) || (df >= 0.55) || (vs >= 0.85));
+  if(chaos) return "CHAOS";
+
+  // BREAKOUT: 변동성 확장(atrChg↑ 또는 bbWidth↑ 또는 volSpike↑) + ADX 상승/추세 시작
+  const breakout = ((ac >= 0.35) || (bw >= 0.075) || (vs >= 0.70)) && (a >= 18) && (ap >= 0.65);
+  if(breakout) return "BREAKOUT";
+
+  // TREND: 추세가 확실(ADX/ts 충분) + 방향 존재
+  if((a >= 23 || ts >= 0.70) && ap >= 0.45){
+    return (t >= 0) ? "TREND_UP" : "TREND_DOWN";
+  }
+
+  // MEAN_REVERT: 변동성은 있으나 추세 약하고(ADX 낮음), 박스 경계/되돌림 가능성이 높음
+  const meanRevert = (ap >= 0.55) && (a < 20) && Number.isFinite(rp) && (rp <= 0.18 || rp >= 0.82);
+  if(meanRevert) return "MEAN_REVERT";
+
+  // RANGE: 변동성/추세 모두 중립, 박스 안에서 왔다갔다
   return "RANGE";
 }
 
-function applyRegimeAdjustment(winProb, edge, regime, agree){
-  let wp = Number(winProb); let ed = Number(edge);
-  const ag = Number(agree)||1;
-
-  if(regime === "TREND"){
-    // 추세장이면 합의(agree)가 높을수록 약간 보너스
-    wp = clamp(wp + Math.min(4, Math.max(0, ag-2)) * 0.006, 0.50, 0.99);
-    ed = Math.max(0, ed + Math.min(4, Math.max(0, ag-2)) * 0.05);
-  }else if(regime === "VOLATILE"){
-    // 과변동은 휩쏘 위험 → 승률/엣지 약간 다운 (단, 합의가 높으면 완화)
-    const k = clamp(1 - Math.min(3, ag-1)*0.18, 0.45, 1.0); // agree 높을수록 완화
-    wp = clamp(wp - 0.02 * k, 0.50, 0.99);
-    ed = Math.max(0, ed - 0.12 * k);
-  }else if(regime === "CALM"){
-    // 저변동은 수익폭 작고 노이즈 많음 → 엣지 중심으로 살짝 다운
-    wp = clamp(wp - 0.01, 0.50, 0.99);
-    ed = Math.max(0, ed - 0.08);
-  }else{
-    // RANGE(횡보): 합의 낮으면 약간 패널티
-    if(ag <= 2) wp = clamp(wp - 0.015, 0.50, 0.99);
-  }
-  return { winProb: wp, edge: ed };
+// ✅ 하위호환(기존 호출부 보호)
+function classifyRegime(trendStrength, atrPct){
+  const ts = Number(trendStrength)||0;
+  const ap = Number(atrPct)||0;
+  // 방향 정보가 없으니 TREND_UP/DOWN 대신 TREND로만 반환
+  if(ts >= 0.55 && ap >= 0.45) return "TREND_UP";
+  if(ap >= 1.25) return "BREAKOUT";
+  if(ap <= 0.25) return "RANGE";
+  return "RANGE";
 }
+
+function applyRegimeAdjustment(winProb, edge, regime, agree, type, base){
+  // ✅ 레짐별 전문가 + 게이팅(완성형)
+  let wp = Number(winProb);
+  let ed = Number(edge);
+  const ag = Number(agree)||1;
+  const dir = (String(type||"").toUpperCase() === "SHORT") ? -1 : 1;
+  const tdir = Number(base?.trend||0);          // +1/-1
+  const ap = Number(base?.atrPct||0);
+  const ac = Number(base?.atrChg||0);
+  const vs = Number(base?.volSpike||0);
+  const rp = Number(base?.rangePos);
+  const df = Number(base?.dirFlip||0);
+
+  const holdReasons = [];
+
+  const isRangePos = Number.isFinite(rp);
+  const nearTop = isRangePos && rp >= 0.85;
+  const nearBot = isRangePos && rp <= 0.15;
+
+  // ④ 진입 직전 현실 필터(최소 3종)
+  const volSpikeNow = (ap >= 1.6) && (ac >= 0.35 || vs >= 0.75);
+  if(volSpikeNow){
+    holdReasons.push("VOL_SPIKE(HOLD)");
+  }
+  const dirFlipNow = (df >= 0.60) && (ag <= 2);
+  if(dirFlipNow){
+    holdReasons.push("DIR_FLIP(HOLD)");
+  }
+  const boxEdgeNow = (isRangePos && (nearTop || nearBot));
+  if(boxEdgeNow){
+    holdReasons.push("BOX_EDGE");
+  }
+
+  // 레짐별 전문가 보정 + 게이팅
+  if(regime === "CHAOS"){
+    // 거의 전부 HOLD
+    holdReasons.push("CHAOS(HARD_HOLD)");
+    return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+  }
+
+  if(regime === "TREND_UP" || regime === "TREND_DOWN"){
+    const trendOk = (tdir === dir); // 방향 정합
+    if(!trendOk && ag <= 3){
+      // 추세 역행 + 합의가 낮으면 강하게 차단
+      holdReasons.push("TREND_MISMATCH(HOLD)");
+      return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+    }
+    // 방향 정합이면 보너스
+    if(trendOk){
+      wp = clamp(wp + 0.010 + Math.max(0, Math.min(3, ag-2))*0.004, 0.50, 0.99);
+      ed = Math.max(0, ed + 0.05);
+    }else{
+      wp = clamp(wp - 0.010, 0.50, 0.99);
+      ed = Math.max(0, ed - 0.06);
+    }
+  }else if(regime === "RANGE"){
+    // RANGE에서는 되돌림 우선: 박스 상단은 SHORT, 하단은 LONG이 유리
+    if(nearTop && dir > 0){
+      holdReasons.push("RANGE_TOP_LONG(HOLD)");
+      return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+    }
+    if(nearBot && dir < 0){
+      holdReasons.push("RANGE_BOT_SHORT(HOLD)");
+      return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+    }
+    // 중앙이면 과신 방지
+    wp = clamp(wp - 0.006, 0.50, 0.99);
+    ed = Math.max(0, ed - 0.03);
+  }else if(regime === "BREAKOUT"){
+    // 돌파/확장: 변동성 확장 신호면 보너스, 아니면 과신 방지
+    const ok = (ac >= 0.25) || (vs >= 0.65);
+    if(ok){
+      wp = clamp(wp + 0.008, 0.50, 0.99);
+      ed = Math.max(0, ed + 0.06);
+    }else{
+      wp = clamp(wp - 0.008, 0.50, 0.99);
+      ed = Math.max(0, ed - 0.05);
+    }
+  }else if(regime === "MEAN_REVERT"){
+    // 되돌림: 박스 경계에서만 적극, 아니면 HOLD
+    if(!boxEdgeNow){
+      holdReasons.push("MEAN_REVERT_NOT_EDGE(HOLD)");
+      return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+    }
+    // 경계에서는 약보너스
+    wp = clamp(wp + 0.006, 0.50, 0.99);
+    ed = Math.max(0, ed + 0.04);
+  }
+
+  // 현실 필터: 변동성 급증/방향 급변은 레짐 무관 HOLD(최우선)
+  if(volSpikeNow || dirFlipNow){
+    return { winProb: wp, edge: ed, hardHold: true, holdReasons };
+  }
+
+  return { winProb: wp, edge: ed, hardHold: false, holdReasons };
+}
+
+
 
 function sleep(ms){
   return new Promise(res => setTimeout(res, ms));

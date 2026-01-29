@@ -431,7 +431,7 @@ function evolveNormalizeFeedback(body){
   const type = String(body?.type || "").toUpperCase().trim(); // LONG/SHORT/HOLD
   const win = (body?.result === "WIN") || (body?.win === true);
   const reason = String(body?.reason || "");
-  const metaKey = (typeof body?.metaKey === "string") ? body.metaKey : null;
+  const metaKey = (typeof body?.evolveKey === "string" && body.evolveKey) ? body.evolveKey : ((typeof body?.metaKey === "string" && body.metaKey) ? body.metaKey : null);
   const ts = Number(body?.ts || body?.closedAt || Date.now());
 
   if(!symbol || !tf) return null;
@@ -626,7 +626,8 @@ app.post("/api/engine/scan_all", async (req,res)=>{
             type: pos.type,
             winProb,
             edge,
-            score: edge,
+            expectancy: (pos?.explain && Number.isFinite(Number(pos.explain.expectancy)) ? Number(pos.explain.expectancy) : null),
+            score: (pos?.explain && Number.isFinite(Number(pos.explain.expectancy)) ? Number(pos.explain.expectancy) : edge),
             isHold: pos.type === "HOLD",
           });
         }
