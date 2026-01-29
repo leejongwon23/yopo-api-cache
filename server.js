@@ -308,6 +308,84 @@ function _absPath(rel){
   return path.join(__dirname, rel);
 }
 
+
+/* ==========================================================
+   EVOLVE (SERVER PERSISTENT MEMORY)
+   - 목적: 성공/실패 피드백을 서버에 영구(파일) 저장하고,
+           재시작 후에도 metaBrain 학습을 복원
+   - 주의: Render 환경 특성상 로컬 파일은 배포/재시작에 따라
+           보존이 보장되지 않을 수 있음(가장 간단한 1차 구현)
+   ========================================================== */
+
+const EVOLVE_FILE = process.env.EVOLVE_FILE || "./evolve_memory.json";
+const EVOLVE_MAX_EVENTS = Number(process.env.EVOLVE_MAX_EVENTS || 5000);
+
+// 메모리 캐시(런타임)
+let evolveMem = { v: 1, events: [] };
+let evolveLoaded = false;
+let evolveSeeded = false;
+let evolveDirty = false;
+let evolveSaveTimer = null;
+
+async function evolveLoad(){
+  if(evolveLoaded) return evolveMem;
+  evolveLoaded = true;
+  try{
+    const p = _absPath(EVOLVE_FILE);
+    const raw = await fs.readFile(p, "utf-8");
+    const obj = JSON.parse(raw);
+    if(obj && typeof obj === "object" && Array.isArray(obj.events)){
+      evolveMem = { v: 1, events: obj.events.slice(-EVOLVE_MAX_EVENTS) };
+    }
+  }catch(e){
+    // 파일 없음/파싱 실패 → 초기화
+    evolveMem = { v: 1, events: [] };
+  }
+  return evolveMem;
+}
+
+function evolveScheduleSave(){
+  evolveDirty = true;
+  if(evolveSaveTimer) return;
+  evolveSaveTimer = setTimeout(async ()=>{
+    evolveSaveTimer = null;
+    if(!evolveDirty) return;
+    evolveDirty = false;
+    try{
+      const p = _absPath(EVOLVE_FILE);
+      const payload = JSON.stringify(evolveMem, null, 2);
+      await fs.writeFile(p, payload, "utf-8");
+    }catch(e){
+      // ignore (환경에 따라 쓰기 실패 가능)
+    }
+  }, 800);
+}
+
+function evolveNormalizeFeedback(body){
+  const symbol = String(body?.symbol || "").toUpperCase().trim();
+  const tf = String(body?.tf ?? body?.tfRaw ?? "");
+  const type = String(body?.type || "").toUpperCase().trim(); // LONG/SHORT
+  const win = (body?.result === "WIN") || (body?.win === true);
+  const reason = String(body?.reason || "");
+  const metaKey = (typeof body?.metaKey === "string") ? body.metaKey : null;
+  const ts = Number(body?.ts || body?.closedAt || Date.now());
+
+  if(!symbol || !tf || !(type === "LONG" || type === "SHORT" || type === "HOLD")) return null;
+
+  return {
+    ts,
+    symbol,
+    tf,
+    type,
+    win,
+    reason,
+    metaKey,
+    pnlPct: Number(body?.pnlPct),
+    mfePct: Number(body?.mfePct),
+  };
+}
+
+
 async function loadAlgoCore(){
   const now = Date.now();
   if(__algoCache && (now - __algoCacheAt) < 10_000) return __algoCache;
@@ -318,8 +396,19 @@ async function loadAlgoCore(){
     const buildSignalFromCandles_MTF = core?.buildSignalFromCandles_MTF;
     const getMTFSet6 = core?.getMTFSet6;
     if(typeof buildSignalFromCandles_MTF === "function"){
-      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6 };
+      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6, evolveApplyFeedback: core?.evolveApplyFeedback, evolveReplayEvents: core?.evolveReplayEvents };
       __algoCacheAt = now;
+
+      // ✅ EVOLVE: 서버 영구 메모리 로드 후 metaBrain 복원(1회)
+      try{
+        if(!evolveSeeded){
+          await evolveLoad();
+          if(typeof __algoCache?.evolveReplayEvents === "function"){
+            __algoCache.evolveReplayEvents(evolveMem.events);
+          }
+          evolveSeeded = true;
+        }
+      }catch(e){}
       return __algoCache;
     }
   }catch(e){
@@ -334,10 +423,23 @@ async function loadAlgoCore(){
 
     const buildSignalFromCandles_MTF = ctx.buildSignalFromCandles_MTF;
     const getMTFSet6 = ctx.getMTFSet6;
+    const evolveApplyFeedback = ctx.evolveApplyFeedback;
+    const evolveReplayEvents = ctx.evolveReplayEvents;
 
     if(typeof buildSignalFromCandles_MTF === "function"){
-      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6 };
+      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6, evolveApplyFeedback: core?.evolveApplyFeedback, evolveReplayEvents: core?.evolveReplayEvents };
       __algoCacheAt = now;
+
+      // ✅ EVOLVE: 서버 영구 메모리 로드 후 metaBrain 복원(1회)
+      try{
+        if(!evolveSeeded){
+          await evolveLoad();
+          if(typeof __algoCache?.evolveReplayEvents === "function"){
+            __algoCache.evolveReplayEvents(evolveMem.events);
+          }
+          evolveSeeded = true;
+        }
+      }catch(e){}
       return __algoCache;
     }
     __algoCache = null;
@@ -597,6 +699,61 @@ app.post("/api/engine/backtest", async (req,res)=>{
     return res.status(500).json({ ok:false, error:"server error: "+(e?.message||String(e)) });
   }
 });
+
+/* ==========================================================
+   EVOLVE ROUTES
+   - POST /api/evolve/feedback : 성공/실패 피드백 누적(서버 영구)
+   - GET  /api/evolve/stats    : 진화 통계 조회(디버그/모니터)
+   ========================================================== */
+
+app.post("/api/evolve/feedback", async (req,res)=>{
+  try{
+    await evolveLoad();
+    const fb = evolveNormalizeFeedback(req.body);
+    if(!fb) return res.status(400).json({ ok:false, error:"BAD_FEEDBACK" });
+
+    // events 누적(최신 유지)
+    evolveMem.events.push(fb);
+    if(evolveMem.events.length > EVOLVE_MAX_EVENTS){
+      evolveMem.events = evolveMem.events.slice(-EVOLVE_MAX_EVENTS);
+    }
+    evolveScheduleSave();
+
+    // 런타임 즉시 반영(재시작 전에도 진화 진행)
+    try{
+      const core = await loadAlgoCore();
+      if(core && typeof core.evolveApplyFeedback === "function"){
+        core.evolveApplyFeedback(fb);
+      }
+    }catch(e){}
+
+    return res.json({ ok:true });
+  }catch(e){
+    return res.status(500).json({ ok:false, error:"SERVER_ERROR", detail: e?.message || String(e) });
+  }
+});
+
+app.get("/api/evolve/stats", async (req,res)=>{
+  try{
+    await evolveLoad();
+    const stats = {};
+    for(const ev of evolveMem.events){
+      const key = ev.metaKey || `${ev.symbol}|${ev.tf}|${ev.type}`;
+      const s = stats[key] || { n:0, w:0, lastTs:0, symbol:ev.symbol, tf:ev.tf, type:ev.type };
+      s.n += 1;
+      if(ev.win) s.w += 1;
+      if(ev.ts > s.lastTs) s.lastTs = ev.ts;
+      stats[key] = s;
+    }
+    const arr = Object.entries(stats).map(([k,v])=>({ key:k, ...v, wr: v.n ? (v.w/v.n) : 0 }));
+    arr.sort((a,b)=> (b.wr - a.wr) || (b.n - a.n) || (b.lastTs - a.lastTs));
+    return res.json({ ok:true, totalEvents: evolveMem.events.length, items: arr.slice(0, 200) });
+  }catch(e){
+    return res.status(500).json({ ok:false, error:"SERVER_ERROR", detail: e?.message || String(e) });
+  }
+});
+
+
 
 app.listen(PORT, ()=>{
   console.log("Listening on", PORT);

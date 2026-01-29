@@ -397,7 +397,37 @@ function metaRecordFromPosition(pos, win, reason){
   }catch(e){}
 }
 
-function applyMetaAdjustment(winProb, key){
+function 
+
+/* ==========================================================
+   EVOLVE (SERVER FEEDBACK BRIDGE)
+   - server.js가 /api/evolve/feedback 로 받은 결과를
+     algo_core의 metaBrain에 반영하기 위한 함수.
+   - server VM 로딩(ctx)에서도 접근 가능하도록 "전역 함수"로 둔다.
+   ========================================================== */
+
+function evolveApplyFeedback(feedback){
+  try{
+    if(!feedback || typeof feedback !== "object") return false;
+    const win = !!feedback.win;
+    const metaKey = (typeof feedback.metaKey === "string" && feedback.metaKey) ? feedback.metaKey : null;
+    if(metaKey) metaUpdate(metaKey, win);
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+function evolveReplayEvents(events){
+  if(!Array.isArray(events)) return 0;
+  let n=0;
+  for(const ev of events){
+    if(evolveApplyFeedback(ev)) n++;
+  }
+  return n;
+}
+
+applyMetaAdjustment(winProb, key){
   const m = metaGetWinRate(key);
   if(!m) return { winProb, meta: null };
 
