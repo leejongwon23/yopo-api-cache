@@ -426,7 +426,6 @@ function metaRecordFromPosition(pos, win, reason){
   }catch(e){}
 }
 
-function 
 
 /* ==========================================================
    EVOLVE (SERVER FEEDBACK BRIDGE)
@@ -434,7 +433,15 @@ function
      algo_core의 metaBrain에 반영하기 위한 함수.
    - server VM 로딩(ctx)에서도 접근 가능하도록 "전역 함수"로 둔다.
    ========================================================== */
-/* FIXED: moved evolveApplyFeedback to standalone export */catch(e){
+
+function evolveApplyFeedback(feedback){
+  try{
+    if(!feedback || typeof feedback !== "object") return false;
+    const win = !!feedback.win;
+    const metaKey = (typeof feedback.evolveKey === "string" && feedback.evolveKey) ? feedback.evolveKey : ((typeof feedback.metaKey === "string" && feedback.metaKey) ? feedback.metaKey : null);
+    if(metaKey) metaUpdate(metaKey, win);
+    return true;
+  }catch(e){
     return false;
   }
 }
@@ -2213,19 +2220,3 @@ function consensusMultiTF(cores, order){
 const MIN_CANDLES_FOR_SIGNAL = 50; // safety guard  // ✅ 유니버스는 항상 30종으로 정규화
   state.universe = normalizeUniverse(state.universe);
 
-
-
-
-/*************************************************************
- * FIX: Standalone exported function for server runtime
- *************************************************************/
-export function evolveApplyFeedback(feedback){
-  try{
-    // TODO: original logic preserved by reference; this wrapper ensures valid ESM syntax.
-    // If original logic relied on closure variables, refactor those to module-level vars.
-    if(!feedback) return { ok:false, reason:"NO_FEEDBACK" };
-    return { ok:true };
-  }catch(e){
-    return { ok:false, reason:"EVOLVE_ERROR", message:e.message };
-  }
-}
