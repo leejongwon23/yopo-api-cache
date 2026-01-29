@@ -464,12 +464,6 @@ app.post("/api/engine/scan_all", async (req,res)=>{
   }
 });
 
-// backtest: 아직 알고리즘 export가 없으면 501로 안내만
-app.post("/api/engine/backtest", async (req,res)=>{
-  return engineNotReady(res, "backtest engine not wired yet");
-});
-
-
 /**
  * POST /api/engine/backtest
  * body: { universe:[...], limitBase?:900, tradesPerTf?:80 }
