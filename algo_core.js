@@ -426,6 +426,7 @@ function metaRecordFromPosition(pos, win, reason){
   }catch(e){}
 }
 
+function 
 
 /* ==========================================================
    EVOLVE (SERVER FEEDBACK BRIDGE)
@@ -455,7 +456,7 @@ function evolveReplayEvents(events){
   return n;
 }
 
-applyMetaAdjustment(winProb, key){
+function applyMetaAdjustment(winProb, key){
   const m = metaGetWinRate(key);
   if(!m) return { winProb, meta: null };
 
