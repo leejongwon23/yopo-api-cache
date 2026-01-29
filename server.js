@@ -299,78 +299,143 @@ async function _fetchPack6(symbol, limitBase=380){
   return { "15":c15, "30":c30, "60":c60, "240":c240, "D":cD, "W":(cW.length?cW:cD) };
 }
 
-let __algoCache = null;
-let __algoCacheAt = 0;
-
-function _absPath(rel){
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  return path.join(__dirname, rel);
-}
-
-
 /* ==========================================================
-   EVOLVE (SERVER PERSISTENT MEMORY)
-   - 목적: 성공/실패 피드백을 서버에 영구(파일) 저장하고,
-           재시작 후에도 metaBrain 학습을 복원
-   - 주의: Render 환경 특성상 로컬 파일은 배포/재시작에 따라
-           보존이 보장되지 않을 수 있음(가장 간단한 1차 구현)
+   ✅ EVOLVE PERSISTENCE (Upstash Redis 확정)
+   - 성공/실패 피드백을 Upstash Redis(REST)로 영구 저장
+   - Upstash 장애/미설정 시: 파일(evolve_memory.json)로 안전 폴백
    ========================================================== */
 
+// Upstash ENV (Render Environment Variables)
+const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").trim();
+const UPSTASH_REDIS_REST_TOKEN = String(process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+const USE_UPSTASH = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+
+// Fallback file (Render Free에서 로컬 파일은 '영구 보장'이 아님. Upstash가 최종 권장)
 const EVOLVE_FILE = process.env.EVOLVE_FILE || "./evolve_memory.json";
 const EVOLVE_MAX_EVENTS = Number(process.env.EVOLVE_MAX_EVENTS || 5000);
 
-// 메모리 캐시(런타임)
+// Upstash key (필요 시 변경 가능)
+const EVOLVE_UPSTASH_KEY = process.env.EVOLVE_UPSTASH_KEY || "yopo:evolve:memory:v1";
+
+// runtime memory
 let evolveMem = { v: 1, events: [] };
 let evolveLoaded = false;
-let evolveSeeded = false;
+let evolveSeeded = false; // algo_core metaBrain에 replay를 1회만 수행
 let evolveDirty = false;
 let evolveSaveTimer = null;
 
-async function evolveLoad(){
-  if(evolveLoaded) return evolveMem;
-  evolveLoaded = true;
+function _upstashBaseUrl(){
+  return UPSTASH_REDIS_REST_URL.replace(/\/+$/,"");
+}
+
+async function upstashGet(key){
+  const url = `${_upstashBaseUrl()}/get/${encodeURIComponent(key)}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      "accept": "application/json",
+    }
+  });
+  if(!r.ok) throw new Error(`UPSTASH_GET_HTTP_${r.status}`);
+  const j = await r.json();
+  return (j && typeof j === "object") ? (j.result ?? null) : null;
+}
+
+async function upstashSet(key, valueStr){
+  const url = `${_upstashBaseUrl()}/set/${encodeURIComponent(key)}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      "content-type": "text/plain; charset=utf-8",
+      "accept": "application/json",
+    },
+    body: String(valueStr ?? "")
+  });
+  if(!r.ok) throw new Error(`UPSTASH_SET_HTTP_${r.status}`);
+  return await r.json().catch(()=>null);
+}
+
+async function evolveLoadFromFile(){
   try{
     const p = _absPath(EVOLVE_FILE);
     const raw = await fs.readFile(p, "utf-8");
     const obj = JSON.parse(raw);
     if(obj && typeof obj === "object" && Array.isArray(obj.events)){
       evolveMem = { v: 1, events: obj.events.slice(-EVOLVE_MAX_EVENTS) };
+      return evolveMem;
     }
-  }catch(e){
-    // 파일 없음/파싱 실패 → 초기화
-    evolveMem = { v: 1, events: [] };
-  }
+  }catch(e){}
+  evolveMem = { v: 1, events: [] };
   return evolveMem;
+}
+
+async function evolveSaveToFile(){
+  try{
+    const p = _absPath(EVOLVE_FILE);
+    await fs.writeFile(p, JSON.stringify(evolveMem, null, 2), "utf-8");
+  }catch(e){}
+}
+
+async function evolveLoad(){
+  if(evolveLoaded) return evolveMem;
+  evolveLoaded = true;
+
+  if(USE_UPSTASH){
+    try{
+      const raw = await upstashGet(EVOLVE_UPSTASH_KEY);
+      if(raw){
+        const obj = JSON.parse(String(raw));
+        if(obj && typeof obj === "object" && Array.isArray(obj.events)){
+          evolveMem = { v: 1, events: obj.events.slice(-EVOLVE_MAX_EVENTS) };
+          return evolveMem;
+        }
+      }
+      evolveMem = { v: 1, events: [] };
+      return evolveMem;
+    }catch(e){
+      // Upstash 실패 → 파일 폴백
+      return await evolveLoadFromFile();
+    }
+  }
+  // Upstash 미설정 → 파일
+  return await evolveLoadFromFile();
 }
 
 function evolveScheduleSave(){
   evolveDirty = true;
   if(evolveSaveTimer) return;
+
   evolveSaveTimer = setTimeout(async ()=>{
     evolveSaveTimer = null;
     if(!evolveDirty) return;
     evolveDirty = false;
-    try{
-      const p = _absPath(EVOLVE_FILE);
-      const payload = JSON.stringify(evolveMem, null, 2);
-      await fs.writeFile(p, payload, "utf-8");
-    }catch(e){
-      // ignore (환경에 따라 쓰기 실패 가능)
+
+    if(USE_UPSTASH){
+      try{
+        await upstashSet(EVOLVE_UPSTASH_KEY, JSON.stringify(evolveMem));
+        return;
+      }catch(e){
+        await evolveSaveToFile();
+        return;
+      }
     }
+    await evolveSaveToFile();
   }, 800);
 }
 
 function evolveNormalizeFeedback(body){
   const symbol = String(body?.symbol || "").toUpperCase().trim();
   const tf = String(body?.tf ?? body?.tfRaw ?? "");
-  const type = String(body?.type || "").toUpperCase().trim(); // LONG/SHORT
+  const type = String(body?.type || "").toUpperCase().trim(); // LONG/SHORT/HOLD
   const win = (body?.result === "WIN") || (body?.win === true);
   const reason = String(body?.reason || "");
   const metaKey = (typeof body?.metaKey === "string") ? body.metaKey : null;
   const ts = Number(body?.ts || body?.closedAt || Date.now());
 
-  if(!symbol || !tf || !(type === "LONG" || type === "SHORT" || type === "HOLD")) return null;
+  if(!symbol || !tf) return null;
+  if(!(type === "LONG" || type === "SHORT" || type === "HOLD")) return null;
 
   return {
     ts,
@@ -385,6 +450,14 @@ function evolveNormalizeFeedback(body){
   };
 }
 
+let __algoCache = null;
+let __algoCacheAt = 0;
+
+function _absPath(rel){
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.join(__dirname, rel);
+}
 
 async function loadAlgoCore(){
   const now = Date.now();
@@ -396,10 +469,15 @@ async function loadAlgoCore(){
     const buildSignalFromCandles_MTF = core?.buildSignalFromCandles_MTF;
     const getMTFSet6 = core?.getMTFSet6;
     if(typeof buildSignalFromCandles_MTF === "function"){
-      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6, evolveApplyFeedback: core?.evolveApplyFeedback, evolveReplayEvents: core?.evolveReplayEvents };
+      __algoCache = {
+        buildSignalFromCandles_MTF,
+        getMTFSet6,
+        evolveApplyFeedback: core?.evolveApplyFeedback,
+        evolveReplayEvents: core?.evolveReplayEvents,
+      };
       __algoCacheAt = now;
 
-      // ✅ EVOLVE: 서버 영구 메모리 로드 후 metaBrain 복원(1회)
+      // ✅ 서버 시작 후 1회만: 저장된 이벤트를 metaBrain에 재생
       try{
         if(!evolveSeeded){
           await evolveLoad();
@@ -427,10 +505,14 @@ async function loadAlgoCore(){
     const evolveReplayEvents = ctx.evolveReplayEvents;
 
     if(typeof buildSignalFromCandles_MTF === "function"){
-      __algoCache = { buildSignalFromCandles_MTF, getMTFSet6, evolveApplyFeedback: core?.evolveApplyFeedback, evolveReplayEvents: core?.evolveReplayEvents };
+      __algoCache = {
+        buildSignalFromCandles_MTF,
+        getMTFSet6,
+        evolveApplyFeedback,
+        evolveReplayEvents,
+      };
       __algoCacheAt = now;
 
-      // ✅ EVOLVE: 서버 영구 메모리 로드 후 metaBrain 복원(1회)
       try{
         if(!evolveSeeded){
           await evolveLoad();
@@ -565,6 +647,12 @@ app.post("/api/engine/scan_all", async (req,res)=>{
     return res.status(500).json({ ok:false, error:"server error: "+(e?.message||String(e)) });
   }
 });
+
+// backtest: 아직 알고리즘 export가 없으면 501로 안내만
+app.post("/api/engine/backtest", async (req,res)=>{
+  return engineNotReady(res, "backtest engine not wired yet");
+});
+
 
 /**
  * POST /api/engine/backtest
@@ -702,8 +790,8 @@ app.post("/api/engine/backtest", async (req,res)=>{
 
 /* ==========================================================
    EVOLVE ROUTES
-   - POST /api/evolve/feedback : 성공/실패 피드백 누적(서버 영구)
-   - GET  /api/evolve/stats    : 진화 통계 조회(디버그/모니터)
+   - POST /api/evolve/feedback : 성공/실패 피드백 누적(Upstash 영구)
+   - GET  /api/evolve/stats    : 통계 조회(디버그)
    ========================================================== */
 
 app.post("/api/evolve/feedback", async (req,res)=>{
@@ -712,14 +800,13 @@ app.post("/api/evolve/feedback", async (req,res)=>{
     const fb = evolveNormalizeFeedback(req.body);
     if(!fb) return res.status(400).json({ ok:false, error:"BAD_FEEDBACK" });
 
-    // events 누적(최신 유지)
     evolveMem.events.push(fb);
     if(evolveMem.events.length > EVOLVE_MAX_EVENTS){
       evolveMem.events = evolveMem.events.slice(-EVOLVE_MAX_EVENTS);
     }
     evolveScheduleSave();
 
-    // 런타임 즉시 반영(재시작 전에도 진화 진행)
+    // 런타임 즉시 반영 (metaBrain)
     try{
       const core = await loadAlgoCore();
       if(core && typeof core.evolveApplyFeedback === "function"){
@@ -727,7 +814,7 @@ app.post("/api/evolve/feedback", async (req,res)=>{
       }
     }catch(e){}
 
-    return res.json({ ok:true });
+    return res.json({ ok:true, persisted: USE_UPSTASH ? "UPSTASH" : "FILE_FALLBACK" });
   }catch(e){
     return res.status(500).json({ ok:false, error:"SERVER_ERROR", detail: e?.message || String(e) });
   }
@@ -747,14 +834,13 @@ app.get("/api/evolve/stats", async (req,res)=>{
     }
     const arr = Object.entries(stats).map(([k,v])=>({ key:k, ...v, wr: v.n ? (v.w/v.n) : 0 }));
     arr.sort((a,b)=> (b.wr - a.wr) || (b.n - a.n) || (b.lastTs - a.lastTs));
-    return res.json({ ok:true, totalEvents: evolveMem.events.length, items: arr.slice(0, 200) });
+    return res.json({ ok:true, totalEvents: evolveMem.events.length, items: arr.slice(0, 200), persisted: USE_UPSTASH ? "UPSTASH" : "FILE_FALLBACK" });
   }catch(e){
     return res.status(500).json({ ok:false, error:"SERVER_ERROR", detail: e?.message || String(e) });
   }
 });
 
-
-
 app.listen(PORT, ()=>{
   console.log("Listening on", PORT);
+  console.log("EVOLVE_PERSIST:", USE_UPSTASH ? "UPSTASH" : "FILE_FALLBACK");
 });
