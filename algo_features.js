@@ -1,12 +1,5 @@
-
 /* === YOPO SAFETY PATCH (AUTO) === */
-(function(){
-  try{
-    if(typeof window !== "undefined"){
-      window.__YOPO_FEATURES_LOADED__ = true;
-    }
-  }catch(e){}
-})();
+(function(){ try{ if(typeof window!=="undefined"){ window.__YOPO_FEATURES_LOADED__=true; } }catch(e){} })();
 /* === END SAFETY PATCH === */
 
 /*************************************************************

@@ -2,8 +2,7 @@
   "schema": "yopo-evolve-v1",
   "version": 1,
   "meta": {
-    "maxEvents": 5000,
-    "note": "auto-normalized"
+    "maxEvents": 5000
   },
   "events": []
 }
