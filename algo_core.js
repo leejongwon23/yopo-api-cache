@@ -8,6 +8,8 @@ const CHAOS_HOLD_BOOST = 1.35;   // HOLD 비중 상향
 const REGIME_SENSITIVITY = 0.85; // 레짐 민감도 완화
 const EV_EDGE_WEIGHT = 0.75;     // EV edge 가중
 
+import { buildPatternKey, applyEvolveAdjust } from "./algo_features.js";
+
 const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
 const mean = (arr)=>arr.reduce((s,x)=>s+x,0)/(arr.length||1);
 
@@ -138,15 +140,28 @@ export function predict(input){
 
     // reality filter
     if(realityHold(candles)){
-      return { ok:true, action:"HOLD", regime, reason:"REALITY_FILTER" };
+      return { ok:true, action:"HOLD", regime, reason:"REALITY_FILTER", patternKey: buildPatternKey({ regime, tf: input?.tf || "", action:"HOLD", coreFeatures: f }) };
     }
 
     const exp = experts(regime, f);
 
+    // --- EVOLVE MEMORY (regime×tf×direction×pattern) ---
+    const baseAction = (exp.long >= exp.short) ? "LONG" : "SHORT";
+    const patternKey = buildPatternKey({ regime, tf: input?.tf || "", action: baseAction, coreFeatures: f });
+    const memStats = input?.memoryStats || null;
+    if(memStats){
+      const adj = applyEvolveAdjust({ pLong: exp.long, pShort: exp.short, key: patternKey, memoryStats: memStats });
+      exp.long = adj.pLong;
+      exp.short = adj.pShort;
+      // attach for debugging
+      input.__evolve = { key: patternKey, evolve: adj.evolve };
+    }
+
+
     // CHAOS -> boost HOLD
     if(regime==="CHAOS"){
       const holdBias = clamp(0.5*CHAOS_HOLD_BOOST, 0.5, 0.85);
-      return { ok:true, action:"HOLD", regime, reason:"CHAOS", holdBias };
+      return { ok:true, action:"HOLD", regime, reason:"CHAOS", holdBias, patternKey };
     }
 
     const tp = input?.tp ?? 0.01;
@@ -159,7 +174,7 @@ export function predict(input){
     if(tp < 0.01) return { ok:true, action:"HOLD", regime, reason:"TP_LT_1PCT" };
 
     if(evLong <= 0 && evShort <= 0){
-      return { ok:true, action:"HOLD", regime, reason:"NEGATIVE_EV", evLong, evShort, pLong:exp.long, pShort:exp.short };
+      return { ok:true, action:"HOLD", regime, reason:"NEGATIVE_EV", evLong, evShort, pLong:exp.long, pShort:exp.short, patternKey };
     }
 
     const action = (evLong >= evShort) ? "LONG" : "SHORT";
@@ -171,7 +186,9 @@ export function predict(input){
       pShort: exp.short,
       evLong,
       evShort,
-      reason: "EV_SELECT"
+      reason: "EV_SELECT",
+      patternKey,
+      evolve: input?.__evolve?.evolve || null
     };
   }catch(e){
     return { ok:true, action:"HOLD", reason:"CORE_ERROR", error: String(e) };
