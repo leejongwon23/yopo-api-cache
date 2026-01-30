@@ -1,3 +1,14 @@
+
+/* === YOPO SAFETY PATCH (AUTO) === */
+(function(){
+  try{
+    if(typeof window !== "undefined"){
+      window.__YOPO_FEATURES_LOADED__ = true;
+    }
+  }catch(e){}
+})();
+/* === END SAFETY PATCH === */
+
 /*************************************************************
  * YOPO AI PRO — app.features.js (분할 v1)
  * 역할: 화면/동작 전부(부트, 차트, 렌더, 분석/스캔/백테스트, 추적/만료, 모달)

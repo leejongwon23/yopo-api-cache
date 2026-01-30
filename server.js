@@ -1,14 +1,10 @@
 
 /*************************************************************
- * YOPO AI PRO — server.js (NEW · CLEAN · RENDER-SAFE)
- * 역할:
- * - Express 서버 부트
- * - 엔진 API 제공 (predict6tf / scan_all / backtest)
- * - 헬스체크 (/ , /ping)
- * - app.api.js 와 100% 호환
+ * YOPO AI PRO — server.js (FIXED · FULL · RENDER-SAFE)
  *************************************************************/
 
 import express from "express";
+import cors from "cors";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 /* =========================
    Middleware
 ========================= */
+app.use(cors());
 app.use(express.json());
 
 /* =========================
@@ -30,40 +27,43 @@ app.get("/ping", (req, res) => {
 });
 
 /* =========================
-   Engine APIs
-   (현재는 엔진 연결 전 최소 정상 응답 구조)
+   Engine APIs (placeholders wired)
 ========================= */
-
-// 통합 예측 (6 TF)
 app.post("/api/engine/predict6tf", (req, res) => {
   const { symbol } = req.body || {};
   res.json({
     ok: true,
-    type: "HOLD",
+    action: "HOLD",
     symbol: symbol || "BTCUSDT",
-    message: "predict6tf engine placeholder (server alive)"
+    reason: "ENGINE_PLACEHOLDER"
   });
 });
 
-// 자동 스캔 (20 코인)
 app.post("/api/engine/scan_all", (req, res) => {
   res.json({
     ok: true,
     results: [],
-    message: "scan_all engine placeholder (server alive)"
+    reason: "ENGINE_PLACEHOLDER"
   });
 });
 
-// 백테스트
 app.post("/api/engine/backtest", (req, res) => {
   res.json({
     ok: true,
-    stats: {
-      trades: 0,
-      winRate: 0
-    },
-    message: "backtest engine placeholder (server alive)"
+    stats: { trades: 0, winRate: 0 },
+    reason: "ENGINE_PLACEHOLDER"
   });
+});
+
+/* =========================
+   Evolve APIs (safe stubs)
+========================= */
+app.post("/api/evolve/feedback", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.get("/api/evolve/stats", (req, res) => {
+  res.json({ ok: true, totalEvents: 0 });
 });
 
 /* =========================
