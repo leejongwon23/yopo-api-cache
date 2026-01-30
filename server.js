@@ -108,53 +108,6 @@ async function fetchKlines(symbol, interval="15m", limit=300){
   throw (lastErr || new Error("BINANCE_FETCH_FAILED"));
 }
 
-// --- lightweight ticker (24h) for UI price list / change% ---
-async function fetchTicker24h(symbol){
-  const sym = String(symbol||"BTCUSDT").toUpperCase();
-  const key = `ticker24h:${sym}`;
-  const cached = cacheGet(key, 5_000);
-  if(cached) return cached;
-
-  let lastErr = null;
-  for(const base of BINANCE_FAPI_BASES){
-    const url = `${base}/fapi/v1/ticker/24hr?symbol=${sym}`;
-    try{
-      const res = await fetchWithTimeout(url, {
-        headers:{
-          "accept":"application/json",
-          "user-agent":"YOPO-AI-PRO/1.0 (+render)"
-        }
-      }, 10_000);
-      if(!res.ok){
-        let body=""; try{ body=(await res.text()).slice(0,200);}catch(_e){}
-        lastErr = new Error(`TICKER_HTTP_${res.status}:${body}`);
-        // mild backoff on bans/rate limits
-        if(res.status===429 || res.status===418 || res.status===451) await sleep(300);
-        continue;
-      }
-      const j = await res.json();
-      const out = {
-        ok:true,
-        symbol: sym,
-        price: Number(j.lastPrice),
-        changePct: Number(j.priceChangePercent),
-        high: Number(j.highPrice),
-        low: Number(j.lowPrice),
-        volume: Number(j.volume),
-        ts: Date.now(),
-        source: base
-      };
-      cacheSet(key, out);
-      return out;
-    }catch(e){
-      lastErr = e;
-      continue;
-    }
-  }
-  throw lastErr || new Error("TICKER_FETCH_FAILED");
-}
-
-
 // ===== Upstash helpers (optional) =====
 const UP_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
@@ -194,22 +147,54 @@ async function evolveStats(){
 app.get("/", (req,res)=>res.json({ ok:true, service:"YOPO AI PRO API", status:"running" }));
 app.get("/ping", (req,res)=>res.send("pong"));
 
-// --- UI support endpoints (no heavy compute) ---
+// ===== Lightweight helpers for UI (no heavy compute) =====
 app.get("/api/universe/top20", (req,res)=>{
-  const limit = Math.max(1, Math.min(20, Number(req.query.limit||20)));
-  res.json({ ok:true, universe: UNIVERSE20.slice(0, limit), updatedAt: Date.now() });
+  res.json({ ok:true, symbols: UNIVERSE20 });
 });
+
+async function fetchTickerPrice(symbol){
+  const key = `ticker:${symbol}`;
+  const cached = cacheGet(key, 3_000);
+  if(cached) return cached;
+
+  const headers = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json,text/plain,*/*",
+  };
+
+  let lastErr = null;
+  for(const base of BINANCE_FAPI_BASES){
+    const url = `${base}/fapi/v1/ticker/price?symbol=${encodeURIComponent(symbol)}`;
+    try{
+      const res = await fetchWithTimeout(url, { headers }, 8_000);
+      if(!res.ok){
+        const txt = await res.text().catch(()=> "");
+        lastErr = new Error(`TICKER_HTTP_${res.status}:${txt.slice(0,180)}`);
+        continue;
+      }
+      const js = await res.json();
+      const out = { symbol: js.symbol || symbol, price: Number(js.price), ts: Date.now(), source: base };
+      cacheSet(key, out);
+      return out;
+    }catch(e){
+      lastErr = e;
+      continue;
+    }
+  }
+  throw lastErr || new Error("TICKER_FAILED");
+}
 
 app.get("/api/market/tick", async (req,res)=>{
   try{
-    const symbol = String(req.query.symbol||"BTCUSDT").toUpperCase();
-    const data = await fetchTicker24h(symbol);
-    res.json(data);
+    const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
+    const data = await fetchTickerPrice(symbol);
+    res.json({ ok:true, ...data });
   }catch(e){
-    console.error("[YOPO][marketTick]", e?.message||e);
-    res.status(500).json({ ok:false, error:"MARKET_TICK_FAILED", message:String(e?.message||e) });
+    console.error("[YOPO][tick]", e?.stack || String(e));
+    res.status(502).json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e) });
   }
 });
+
 
 // ===== Engine =====
 app.post("/api/engine/predict6tf", async (req,res)=>{
