@@ -29,11 +29,21 @@ const TF_MAP = {
   "1w":"1w",
 };
 
-// Binance Futures public endpoints can sometimes block certain IP ranges.
-// We try multiple base URLs (official + Vision) with a short timeout.
-const BINANCE_FAPI_BASES = [
+// Binance endpoints can sometimes block certain IP ranges.
+// We try multiple base URLs (Futures + Vision + Spot) with a short timeout.
+const BINANCE_FUTURES_BASES = [
+  // Futures (USDT)
   "https://fapi.binance.com",
   "https://fapi.binance.vision",
+];
+
+const BINANCE_TICKER_BASES = [
+  // Futures first
+  "https://fapi.binance.com",
+  "https://fapi.binance.vision",
+  // Spot fallback (price is close enough for UI display)
+  "https://api.binance.com",
+  "https://data-api.binance.vision",
 ];
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
@@ -67,7 +77,7 @@ async function fetchKlines(symbol, interval="15m", limit=300){
   if(cached) return cached;
 
   let lastErr = null;
-  for(const base of BINANCE_FAPI_BASES){
+  for(const base of BINANCE_FUTURES_BASES){
     const url = `${base}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     try{
       const res = await fetchWithTimeout(url, {
@@ -154,7 +164,8 @@ app.get("/api/universe/top20", (req,res)=>{
 
 async function fetchTickerPrice(symbol){
   const key = `ticker:${symbol}`;
-  const cached = cacheGet(key, 3_000);
+  // short TTL to reduce upstream load
+  const cached = cacheGet(key, 10_000);
   if(cached) return cached;
 
   const headers = {
@@ -163,8 +174,10 @@ async function fetchTickerPrice(symbol){
   };
 
   let lastErr = null;
-  for(const base of BINANCE_FAPI_BASES){
-    const url = `${base}/fapi/v1/ticker/price?symbol=${encodeURIComponent(symbol)}`;
+  for(const base of BINANCE_TICKER_BASES){
+    const isSpot = base.includes("api.binance.com") || base.includes("data-api.binance.vision");
+    const path = isSpot ? "/api/v3/ticker/price" : "/fapi/v1/ticker/price";
+    const url = `${base}${path}?symbol=${encodeURIComponent(symbol)}`;
     try{
       const res = await fetchWithTimeout(url, { headers }, 8_000);
       if(!res.ok){
@@ -190,8 +203,18 @@ app.get("/api/market/tick", async (req,res)=>{
     const data = await fetchTickerPrice(symbol);
     res.json({ ok:true, ...data });
   }catch(e){
+    // IMPORTANT:
+    // - This endpoint is for UI display only.
+    // - Never hard-fail the UI. Return a soft error with the last cached value if available.
+    const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
+    const key = `ticker:${symbol}`;
+    const last = cache.get(key)?.data || null;
     console.error("[YOPO][tick]", e?.stack || String(e));
-    res.status(502).json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e) });
+    if(last && Number.isFinite(last.price)){
+      return res.json({ ok:true, ...last, stale:true, warn:"UPSTREAM_TICK_FAILED" });
+    }
+    // still return 200 so the browser doesn't spam "Failed to load resource" errors
+    return res.json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e), stale:false });
   }
 });
 
