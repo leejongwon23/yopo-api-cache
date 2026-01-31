@@ -2,7 +2,6 @@
  * YOPO AI PRO — algo_core.js (FULL)
  * - Regime (6) + Experts gating + Reality filter + EV 선택
  *************************************************************/
-import { computeFeatures } from "./algo_features.js";
 
 // === YOPO TUNING (AUTO) ===
 const CHAOS_HOLD_BOOST = 1.35;   // HOLD 비중 상향
@@ -35,8 +34,7 @@ function computeCoreFeatures(candles){
   // mean revert proxy: distance from mean
   const m = mean(closes.slice(n-look));
   const dev = (last - m)/m;
-  return {
-    meta: { features: _feats }, vol, trend, range, breakoutUp, breakoutDn, dev };
+  return { vol, trend, range, breakoutUp, breakoutDn, dev };
 }
 
 export function detectRegime(candles){
@@ -87,8 +85,7 @@ function experts(regime, f){
   long = 0.5 + (long-0.5)*damp;
   short = 0.5 + (short-0.5)*damp;
 
-  return {
-    meta: { features: _feats }, long: clamp(long,0,1), short: clamp(short,0,1) };
+  return { long: clamp(long,0,1), short: clamp(short,0,1) };
 }
 
 // Reality filter: return true if should HOLD
@@ -130,12 +127,10 @@ function computeEV(p, tp, sl){
  *  { symbol, tf, candles, tp, sl, memoryStats? }
  */
 export function predict(input){
-  const _feats = computeFeatures(candles);
   try{
     const candles = input?.candles || [];
     if(candles.length < 60){
-      return {
-    meta: { features: _feats }, ok:true, action:"HOLD", reason:"NOT_ENOUGH_CANDLES" };
+      return { ok:true, action:"HOLD", reason:"NOT_ENOUGH_CANDLES" };
     }
 
     const regime = detectRegime(candles);
@@ -143,8 +138,7 @@ export function predict(input){
 
     // reality filter
     if(realityHold(candles)){
-      return {
-    meta: { features: _feats }, ok:true, action:"HOLD", regime, reason:"REALITY_FILTER" };
+      return { ok:true, action:"HOLD", regime, reason:"REALITY_FILTER" };
     }
 
     const exp = experts(regime, f);
@@ -152,8 +146,7 @@ export function predict(input){
     // CHAOS -> boost HOLD
     if(regime==="CHAOS"){
       const holdBias = clamp(0.5*CHAOS_HOLD_BOOST, 0.5, 0.85);
-      return {
-    meta: { features: _feats }, ok:true, action:"HOLD", regime, reason:"CHAOS", holdBias };
+      return { ok:true, action:"HOLD", regime, reason:"CHAOS", holdBias };
     }
 
     const tp = input?.tp ?? 0.01;
@@ -166,13 +159,11 @@ export function predict(input){
     if(tp < 0.01) return { ok:true, action:"HOLD", regime, reason:"TP_LT_1PCT" };
 
     if(evLong <= 0 && evShort <= 0){
-      return {
-    meta: { features: _feats }, ok:true, action:"HOLD", regime, reason:"NEGATIVE_EV", evLong, evShort, pLong:exp.long, pShort:exp.short };
+      return { ok:true, action:"HOLD", regime, reason:"NEGATIVE_EV", evLong, evShort, pLong:exp.long, pShort:exp.short };
     }
 
     const action = (evLong >= evShort) ? "LONG" : "SHORT";
     return {
-    meta: { features: _feats },
       ok:true,
       action,
       regime,
@@ -183,7 +174,6 @@ export function predict(input){
       reason: "EV_SELECT"
     };
   }catch(e){
-    return {
-    meta: { features: _feats }, ok:true, action:"HOLD", reason:"CORE_ERROR", error: String(e) };
+    return { ok:true, action:"HOLD", reason:"CORE_ERROR", error: String(e) };
   }
 }
