@@ -3,6 +3,9 @@
  *************************************************************/
 import express from "express";
 import cors from "cors";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 import { predict, detectRegime } from "./algo_core.js";
 
 const app = express();
@@ -166,11 +169,42 @@ async function fetchKlinesSafe(symbol, interval="15m", limit=300){
   return null;
 }
 
+
 // ===== Upstash helpers (optional) =====
 const UP_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const EVOLVE_KEY = process.env.EVOLVE_UPSTASH_KEY || "yopo:evolve:events";
 const EVOLVE_MAX = Number(process.env.EVOLVE_MAX_EVENTS || 5000);
+
+// local fallback file (optional)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const EVOLVE_FILE = path.join(__dirname, "evolve_memory.json");
+let _localEvolveCache = null; // loaded lazily: {schema,version,meta,events:[]}
+
+async function _loadLocalEvolve(){
+  if(_localEvolveCache) return _localEvolveCache;
+  try{
+    const raw = await fs.readFile(EVOLVE_FILE, "utf-8");
+    const j = JSON.parse(raw);
+    if(j && Array.isArray(j.events)) _localEvolveCache = j;
+  }catch(_e){}
+  if(!_localEvolveCache){
+    _localEvolveCache = { schema:"yopo-evolve-v1", version:1, meta:{ maxEvents: EVOLVE_MAX }, events:[] };
+  }
+  return _localEvolveCache;
+}
+
+async function _saveLocalEvolve(){
+  try{
+    if(!_localEvolveCache) return;
+    // trim
+    if(_localEvolveCache.events.length > EVOLVE_MAX){
+      _localEvolveCache.events.length = EVOLVE_MAX;
+    }
+    await fs.writeFile(EVOLVE_FILE, JSON.stringify(_localEvolveCache, null, 2), "utf-8");
+  }catch(_e){}
+}
 
 async function upstashCommand(cmd, args=[]){
   if(!UP_URL || !UP_TOKEN) return null;
@@ -188,8 +222,13 @@ async function evolveAppend(eventObj){
     await upstashCommand("ltrim", [EVOLVE_KEY, "0", String(EVOLVE_MAX-1)]);
     return { storage:"upstash" };
   }
-  // fallback: no persistent storage if Upstash absent
-  return { storage:"none" };
+
+  // local file fallback (best-effort)
+  const j = await _loadLocalEvolve();
+  j.events.unshift(eventObj);
+  if(j.events.length > EVOLVE_MAX) j.events.length = EVOLVE_MAX;
+  await _saveLocalEvolve();
+  return { storage:"file" };
 }
 
 async function evolveStats(){
@@ -198,6 +237,9 @@ async function evolveStats(){
     const total = r?.result ?? 0;
     return { ok:true, totalEvents: total, storage:"upstash" };
   }
+  const j = await _loadLocalEvolve();
+  return { ok:true, totalEvents: (j.events||[]).length, storage:"file" };
+}
   return { ok:true, totalEvents: 0, storage:"none" };
 }
 
@@ -252,6 +294,7 @@ app.get("/api/market/tick", async (req,res)=>{
   try{
     const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
     const data = await fetchTickerPrice(symbol);
+    if(!data) return res.json({ ok:false, error:"TICK_NO_DATA" });
     res.json({ ok:true, ...data });
   }catch(e){
     // IMPORTANT:
@@ -483,16 +526,48 @@ app.post("/api/engine/backtest", async (req,res)=>{
 // ===== Evolve =====
 app.post("/api/evolve/feedback", async (req,res)=>{
   try{
+    // Accept multiple client formats (compat):
+    // A) {action, win, pnl, regime, meta}
+    // B) {side, result:"TP"/"SL", entry, exit, tpPct, slPct, openedAt, closedAt, ...}
+    const b = req.body || {};
+
+    let action = (b.action || b.side || "").toUpperCase();
+    if(action==="LONG" || action==="SHORT"){} else action = String(b.action||b.side||"");
+
+    let win = false;
+    if(typeof b.win === "boolean") win = b.win;
+    else if(typeof b.result === "string") win = (b.result.toUpperCase() === "TP" || b.result.toUpperCase() === "WIN");
+
+    let pnl = Number(b.pnl || 0);
+    // derive pnl if entry/exit exist
+    const entry = Number(b.entry);
+    const exit = Number(b.exit);
+    if(!Number.isFinite(pnl) && Number.isFinite(entry) && Number.isFinite(exit)){
+      pnl = 0;
+    }
+    if(Number.isFinite(entry) && Number.isFinite(exit)){
+      const side = (b.side || b.action || "").toUpperCase();
+      const r = (side==="SHORT") ? (entry/exit - 1) : (exit/entry - 1);
+      if(Number.isFinite(r)) pnl = r;
+    }
+
     const evt = {
       ts: Date.now(),
-      symbol: (req.body?.symbol || "").toUpperCase(),
-      tf: req.body?.tf || "",
-      action: req.body?.action || "",
-      win: !!req.body?.win,
-      pnl: Number(req.body?.pnl || 0),
-      regime: req.body?.regime || "",
-      meta: req.body?.meta || {}
+      symbol: String(b.symbol || "").toUpperCase(),
+      tf: b.tf || "",
+      action: action || "",
+      win: !!win,
+      pnl: Number.isFinite(pnl) ? pnl : 0,
+      regime: b.regime || "",
+      meta: b.meta || {
+        result: b.result,
+        tpPct: b.tpPct,
+        slPct: b.slPct,
+        openedAt: b.openedAt,
+        closedAt: b.closedAt
+      }
     };
+
     const r = await evolveAppend(evt);
     res.json({ ok:true, stored: r.storage });
   }catch(e){
