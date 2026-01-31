@@ -335,7 +335,7 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
     for(const r of results){
       if(r.action==="HOLD") continue;
       const ev = (r.action==="LONG") ? r.evLong : r.evShort;
-      if(best===null || ev > best.ev){
+      if(Number.isFinite(ev) && (best===null || ev > best.ev)){
         best = { tf:r.tf, action:r.action, ev, regime:r.regime, pLong:r.pLong, pShort:r.pShort, reason:r.reason, lastClose:r.lastClose ?? null };
       }
     }
@@ -483,12 +483,14 @@ app.post("/api/engine/backtest", async (req,res)=>{
 // ===== Evolve =====
 app.post("/api/evolve/feedback", async (req,res)=>{
   try{
+    const result = req.body?.result;
+    const winFlag = (typeof req.body?.win === 'boolean') ? req.body.win : (result === 'TP');
     const evt = {
       ts: Date.now(),
       symbol: (req.body?.symbol || "").toUpperCase(),
       tf: req.body?.tf || "",
       action: req.body?.action || "",
-      win: !!req.body?.win,
+      win: winFlag,
       pnl: Number(req.body?.pnl || 0),
       regime: req.body?.regime || "",
       meta: req.body?.meta || {}

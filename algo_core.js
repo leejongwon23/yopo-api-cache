@@ -24,16 +24,26 @@ function computeCoreFeatures(candles){
   const vol = Math.sqrt(mean(rets.map(r=>r*r)) || 0);
   const trend = (closes[n-1]-closes[0]) / closes[0];
   const range = (Math.max(...highs)-Math.min(...lows)) / closes[n-1];
-  // breakout score: last close vs recent high/low
+  // breakout score: last close vs prior recent high/low (exclude current candle)
+  // - if last close is above prior recent high -> breakoutUp > 0
+  // - if last close is below prior recent low  -> breakoutDn > 0
   const look = Math.min(30, n-1);
-  const recentHigh = Math.max(...highs.slice(n-look));
-  const recentLow  = Math.min(...lows.slice(n-look));
+  const from = Math.max(0, n - look);
+
+  // exclude last candle to avoid self-inclusion
+  const highsPrev = highs.slice(from, Math.max(from, n-1));
+  const lowsPrev  = lows.slice(from, Math.max(from, n-1));
   const last = closes[n-1];
-  const breakoutUp = (last - recentHigh)/last;
-  const breakoutDn = (recentLow - last)/last;
+
+  const recentHighPrev = (highsPrev.length ? Math.max(...highsPrev) : highs[n-1]);
+  const recentLowPrev  = (lowsPrev.length  ? Math.min(...lowsPrev)  : lows[n-1]);
+
+  const breakoutUp = (last - recentHighPrev) / (recentHighPrev || last || 1);
+  const breakoutDn = (recentLowPrev - last) / (recentLowPrev  || last || 1);
+
   // mean revert proxy: distance from mean
-  const m = mean(closes.slice(n-look));
-  const dev = (last - m)/m;
+  const m = mean(closes.slice(from));
+  const dev = (last - m) / (m || last || 1);
   return { vol, trend, range, breakoutUp, breakoutDn, dev };
 }
 
@@ -67,8 +77,8 @@ function experts(regime, f){
   if(regime==="TREND_DOWN"){ long = 0.35; short=0.65; }
   if(regime==="RANGE"){ long = 0.50; short=0.50; }
   if(regime==="BREAKOUT"){
-    // direction based on breakout indicators
-    if(f.breakoutUp>0) { long=0.62; short=0.38; }
+    // direction based on breakout indicators (bigger breakout wins)
+    if((f.breakoutUp||0) >= (f.breakoutDn||0)) { long=0.62; short=0.38; }
     else { long=0.38; short=0.62; }
   }
   if(regime==="MEAN_REVERT"){

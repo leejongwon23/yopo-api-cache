@@ -10,4 +10,4 @@
 // (현재 algo_core.js는 이 모듈을 직접 require 하지 않습니다.)
 // 향후 확장 시, 순수 함수만 추가하세요.
 
-module.exports = {};
+export default {};
