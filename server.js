@@ -250,22 +250,51 @@ async function fetchTickerPrice(symbol){
 
 app.get("/api/market/tick", async (req,res)=>{
   try{
-    const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
-    const data = await fetchTickerPrice(symbol);
-    res.json({ ok:true, ...data });
-  }catch(e){
-    // IMPORTANT:
-    // - This endpoint is for UI display only.
-    // - Never hard-fail the UI. Return a soft error with the last cached value if available.
-    const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
-    const key = `ticker:${symbol}`;
-    const last = cache.get(key)?.data || null;
-    console.error("[YOPO][tick]", e?.stack || String(e));
-    if(last && Number.isFinite(last.price)){
-      return res.json({ ok:true, ...last, stale:true, warn:"UPSTREAM_TICK_FAILED" });
+    // ✅ Supports both:
+    // - /api/market/tick?symbol=BTCUSDT
+    // - /api/market/tick?symbols=BTCUSDT,ETHUSDT
+    const qsSymbol = req.query?.symbol;
+    const qsSymbols = req.query?.symbols;
+
+    // Build symbol list
+    let list = [];
+    if(typeof qsSymbols === "string" && qsSymbols.trim()){
+      list = qsSymbols.split(",").map(s=>String(s).trim().toUpperCase()).filter(Boolean);
+    }else if(typeof qsSymbol === "string" && qsSymbol.trim()){
+      list = [String(qsSymbol).trim().toUpperCase()];
+    }else{
+      list = ["BTCUSDT"];
     }
+
+    // Limit to avoid abuse (UI needs max 20)
+    if(list.length > 30) list = list.slice(0, 30);
+
+    const out = {};
+    for(const sym of list){
+      const t = await fetchTickerPrice(sym);
+      if(t && Number.isFinite(t.price)){
+        out[sym] = { price: t.price, chgPct: Number(t.chg || 0) };
+      }
+    }
+
+    // Backward compatibility:
+    // If caller used single-symbol mode, return flat shape.
+    if(list.length === 1 && !qsSymbols){
+      const sym = list[0];
+      const v = out[sym] || null;
+      if(v){
+        return res.json({ ok:true, symbol:sym, price:v.price, chg:v.chgPct });
+      }
+      // Soft response (still 200)
+      return res.json({ ok:false, symbol:sym, error:"NO_TICK", message:"NO_DATA" });
+    }
+
+    // Multi-symbol response (recommended for UI)
+    return res.json({ ok:true, data: out, symbols: list });
+  }catch(e){
+    console.error("[YOPO][tick]", e?.stack || String(e));
     // still return 200 so the browser doesn't spam "Failed to load resource" errors
-    return res.json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e), stale:false });
+    return res.json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e) });
   }
 });
 
@@ -335,7 +364,7 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
     for(const r of results){
       if(r.action==="HOLD") continue;
       const ev = (r.action==="LONG") ? r.evLong : r.evShort;
-      if(Number.isFinite(ev) && (best===null || ev > best.ev)){
+      if(best===null || ev > best.ev){
         best = { tf:r.tf, action:r.action, ev, regime:r.regime, pLong:r.pLong, pShort:r.pShort, reason:r.reason, lastClose:r.lastClose ?? null };
       }
     }
@@ -483,14 +512,12 @@ app.post("/api/engine/backtest", async (req,res)=>{
 // ===== Evolve =====
 app.post("/api/evolve/feedback", async (req,res)=>{
   try{
-    const result = req.body?.result;
-    const winFlag = (typeof req.body?.win === 'boolean') ? req.body.win : (result === 'TP');
     const evt = {
       ts: Date.now(),
       symbol: (req.body?.symbol || "").toUpperCase(),
       tf: req.body?.tf || "",
       action: req.body?.action || "",
-      win: winFlag,
+      win: !!req.body?.win,
       pnl: Number(req.body?.pnl || 0),
       regime: req.body?.regime || "",
       meta: req.body?.meta || {}
