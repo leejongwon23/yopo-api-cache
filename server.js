@@ -1,6 +1,6 @@
 /*************************************************************
  * YOPO AI PRO — server.js (FULL · BINANCE20 · EVOLVE/UPSTASH)
- * FIX: Futures 차단 시 Spot 자동 fallback
+ * FIX: futures blocked on Render -> add SPOT fallback for tick + klines
  *************************************************************/
 import express from "express";
 import cors from "cors";
@@ -20,19 +20,28 @@ const UNIVERSE20 = [
   "OPUSDT","ARBUSDT","INJUSDT","APTUSDT","SUIUSDT"
 ];
 
-// 6TF fixed set for YOPO AI PRO
+// 6TF fixed set for YOPO AI PRO (spec): 15m / 30m / 1h / 4h / 1d / 1w
 const TF_MAP = {
-  "15m":"15m","30m":"30m","1h":"1h","4h":"4h","1d":"1d","1w":"1w"
+  "15m":"15m",
+  "30m":"30m",
+  "1h":"1h",
+  "4h":"4h",
+  "1d":"1d",
+  "1w":"1w",
 };
 
-// Binance endpoints
+// ✅ Futures endpoints (often blocked by region/IP)
 const BINANCE_FUTURES_BASES = [
   "https://fapi.binance.com",
   "https://fapi.binance.vision",
 ];
+
+// ✅ Spot endpoints (fallback if futures blocked)
 const BINANCE_SPOT_BASES = [
   "https://api.binance.com",
-  "https://api.binance.vision",
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+  "https://api3.binance.com",
 ];
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
@@ -58,6 +67,12 @@ function cacheGet(key, ttlMs){
 }
 function cacheSet(key, data){
   cache.set(key, { ts: Date.now(), data });
+}
+
+async function fetchKlines(symbol, interval="15m", limit=300){
+  const candles = await fetchKlinesSafe(symbol, interval, limit);
+  if(!candles) throw new Error("BINANCE_FETCH_FAILED");
+  return candles;
 }
 
 function _parseKlinesArray(arr){
@@ -92,61 +107,7 @@ function atrPctFromCandles(candles, period=14){
   return Number.isFinite(pct) && pct>0 ? pct : 0.01;
 }
 
-/**
- * Safe klines fetch
- * Futures → Spot fallback (ADDED)
- */
-async function fetchKlinesSafe(symbol, interval="15m", limit=300){
-  const key = `klines:${symbol}:${interval}:${limit}`;
-  const cached = cacheGet(key, 20_000);
-  if(cached) return cached;
-
-  const headers = {
-    "accept":"application/json",
-    "user-agent":"YOPO-AI-PRO/1.0 (+render)"
-  };
-
-  let lastErr = null;
-
-  // 1) Futures
-  for(const base of BINANCE_FUTURES_BASES){
-    try{
-      const url = `${base}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
-      const res = await fetchWithTimeout(url, { headers }, 12_000);
-      if(!res.ok){
-        if(res.status===429 || res.status===418 || res.status===451) await sleep(400);
-        lastErr = new Error(`FUTURES_${res.status}`);
-        continue;
-      }
-      const arr = await res.json();
-      const candles = _parseKlinesArray(arr);
-      if(candles && candles.length){
-        cacheSet(key, candles);
-        return candles;
-      }
-    }catch(e){ lastErr = e; }
-  }
-
-  // 2) Spot fallback
-  for(const base of BINANCE_SPOT_BASES){
-    try{
-      const url = `${base}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
-      const res = await fetchWithTimeout(url, { headers }, 12_000);
-      if(!res.ok) continue;
-      const arr = await res.json();
-      const candles = _parseKlinesArray(arr);
-      if(candles && candles.length){
-        cacheSet(key, candles);
-        return candles;
-      }
-    }catch(e){}
-  }
-
-  console.error("[YOPO][fetchKlinesSafe] fail", symbol, interval, limit, String(lastErr?.message||lastErr));
-  return null;
-}
-
-// ===== Upstash helpers =====
+// ===== Upstash helpers (optional) =====
 const UP_URL = process.env.UPSTASH_REDIS_REST_URL || "";
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const EVOLVE_KEY = process.env.EVOLVE_UPSTASH_KEY || "yopo:evolve:events";
@@ -183,60 +144,136 @@ async function evolveStats(){
 app.get("/", (req,res)=>res.json({ ok:true, service:"YOPO AI PRO API", status:"running" }));
 app.get("/ping", (req,res)=>res.send("pong"));
 
-// ===== Universe =====
+// ===== Lightweight helpers for UI (no heavy compute) =====
 app.get("/api/universe/top20", (req,res)=>{
   res.json({ ok:true, symbols: UNIVERSE20 });
 });
 
-/**
- * fetchTickerPrice
- * Futures → Spot fallback (ADDED)
- */
+function _headers(){
+  return {
+    "accept":"application/json",
+    "user-agent":"YOPO-AI-PRO/1.0 (+render)"
+  };
+}
+
+async function _tryJson(url, timeoutMs){
+  try{
+    const res = await fetchWithTimeout(url, { headers:_headers() }, timeoutMs);
+    if(!res.ok){
+      let body = "";
+      try{ body = (await res.text()).slice(0, 200); }catch(_e){}
+      return { ok:false, status:res.status, body };
+    }
+    const j = await res.json();
+    return { ok:true, json:j };
+  }catch(e){
+    return { ok:false, err:String(e?.message || e) };
+  }
+}
+
 async function fetchTickerPrice(symbol){
   const key = `ticker:${symbol}`;
   const cached = cacheGet(key, 10_000);
   if(cached) return cached;
 
-  const headers = {
-    "accept":"application/json",
-    "user-agent":"YOPO-AI-PRO/1.0 (+render)"
-  };
+  let lastErr = null;
 
-  // 1) Futures
+  // 1) Futures ticker
   for(const base of BINANCE_FUTURES_BASES){
-    try{
-      const url = `${base}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-      const res = await fetchWithTimeout(url, { headers }, 10_000);
-      if(!res.ok) continue;
-      const j = await res.json();
-      const price = Number(j?.lastPrice);
-      const chg = Number(j?.priceChangePercent);
-      if(Number.isFinite(price)){
-        const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
-        cacheSet(key, out);
-        return out;
-      }
-    }catch(e){}
+    const url = `${base}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+    const r = await _tryJson(url, 10_000);
+    if(!r.ok){
+      lastErr = r;
+      continue;
+    }
+    const j = r.json;
+    const price = Number(j?.lastPrice);
+    const chg = Number(j?.priceChangePercent);
+    if(!Number.isFinite(price)){
+      lastErr = { ok:false, err:"BAD_FUTURES_TICKER_PRICE" };
+      continue;
+    }
+    const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
+    cacheSet(key, out);
+    return out;
   }
 
-  // 2) Spot fallback
+  // 2) Spot ticker fallback
   for(const base of BINANCE_SPOT_BASES){
-    try{
-      const url = `${base}/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-      const res = await fetchWithTimeout(url, { headers }, 10_000);
-      if(!res.ok) continue;
-      const j = await res.json();
-      const price = Number(j?.lastPrice);
-      const chg = Number(j?.priceChangePercent);
-      if(Number.isFinite(price)){
-        const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
-        cacheSet(key, out);
-        return out;
-      }
-    }catch(e){}
+    const url = `${base}/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+    const r = await _tryJson(url, 10_000);
+    if(!r.ok){
+      lastErr = r;
+      continue;
+    }
+    const j = r.json;
+    const price = Number(j?.lastPrice);
+    const chg = Number(j?.priceChangePercent);
+    if(!Number.isFinite(price)){
+      lastErr = { ok:false, err:"BAD_SPOT_TICKER_PRICE" };
+      continue;
+    }
+    const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
+    cacheSet(key, out);
+    return out;
   }
 
-  console.error("[YOPO][fetchTickerPrice] fail", symbol);
+  console.error("[YOPO][fetchTickerPrice] fail", symbol, lastErr?.status || "", lastErr?.err || "", lastErr?.body || "");
+  return null;
+}
+
+/**
+ * ✅ Safe klines fetch:
+ * - Try futures klines
+ * - If futures blocked -> fallback to spot klines
+ * - Returns null on failure (never hard-crash engine endpoints)
+ * - Caches successful results briefly
+ */
+async function fetchKlinesSafe(symbol, interval="15m", limit=300){
+  const key = `klines:${symbol}:${interval}:${limit}`;
+  const cached = cacheGet(key, 20_000);
+  if(cached) return cached;
+
+  let lastErr = null;
+
+  // 1) Futures klines
+  for(const base of BINANCE_FUTURES_BASES){
+    const url = `${base}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+    const r = await _tryJson(url, 12_000);
+    if(!r.ok){
+      // retry small backoff on rate-limit-ish statuses (if status exists)
+      if(r.status===429 || r.status===418 || r.status===451) await sleep(400);
+      lastErr = r;
+      continue;
+    }
+    const candles = _parseKlinesArray(r.json);
+    if(!candles || candles.length===0){
+      lastErr = { ok:false, err:"FUTURES_EMPTY" };
+      continue;
+    }
+    cacheSet(key, candles);
+    return candles;
+  }
+
+  // 2) Spot klines fallback
+  for(const base of BINANCE_SPOT_BASES){
+    const url = `${base}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+    const r = await _tryJson(url, 12_000);
+    if(!r.ok){
+      if(r.status===429 || r.status===418 || r.status===451) await sleep(400);
+      lastErr = r;
+      continue;
+    }
+    const candles = _parseKlinesArray(r.json);
+    if(!candles || candles.length===0){
+      lastErr = { ok:false, err:"SPOT_EMPTY" };
+      continue;
+    }
+    cacheSet(key, candles);
+    return candles;
+  }
+
+  console.error("[YOPO][fetchKlinesSafe] fail", symbol, interval, limit, lastErr?.status || "", lastErr?.err || "", lastErr?.body || "");
   return null;
 }
 
@@ -258,7 +295,10 @@ app.get("/api/market/tick", async (req,res)=>{
 
     const out = {};
     for(const sym of list){
+      // 1) try ticker (futures -> spot)
       let t = await fetchTickerPrice(sym);
+
+      // 2) fallback to last candle close (15m) if ticker still fails
       if(!t){
         const candles = await fetchKlinesSafe(sym, "15m", 50);
         if(candles && candles.length){
@@ -266,15 +306,20 @@ app.get("/api/market/tick", async (req,res)=>{
           if(Number.isFinite(last)) t = { price:last, chg:0 };
         }
       }
+
       if(t && Number.isFinite(t.price)){
         out[sym] = { price: t.price, chgPct: Number(t.chg || 0) };
       }
     }
 
+    // single-symbol mode: always ok:true
     if(list.length === 1 && !qsSymbols){
       const sym = list[0];
       const v = out[sym];
-      return res.json({ ok:true, symbol:sym, price:v?.price ?? 0, chg:v?.chgPct ?? 0 });
+      if(v){
+        return res.json({ ok:true, symbol:sym, price:v.price, chg:v.chgPct });
+      }
+      return res.json({ ok:true, symbol:sym, price:0, chg:0 });
     }
 
     return res.json({ ok:true, data: out, symbols: list });
@@ -291,6 +336,7 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
     const tfs = ["15m","30m","1h","4h","1d","1w"];
     const results = [];
 
+    // fallback last price (best effort)
     let lastPrice = null;
     try{
       const t = await fetchTickerPrice(symbol);
@@ -325,7 +371,11 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
         outp.tpPct = tp;
         outp.slPct = sl;
         const lastClose = Number(candles[candles.length-1]?.close);
-        results.push({ tf, ...outp, lastClose: Number.isFinite(lastClose) ? lastClose : (Number.isFinite(lastPrice) ? lastPrice : null) });
+        results.push({
+          tf,
+          ...outp,
+          lastClose: Number.isFinite(lastClose) ? lastClose : (Number.isFinite(lastPrice) ? lastPrice : null)
+        });
       }catch(e){
         console.error("[YOPO][predict6tf][per_tf]", symbol, tf, String(e?.message||e));
         const lastClose = Number(candles[candles.length-1]?.close);
@@ -349,7 +399,16 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
       if(r.action==="HOLD") continue;
       const ev = (r.action==="LONG") ? r.evLong : r.evShort;
       if(best===null || ev > best.ev){
-        best = { tf:r.tf, action:r.action, ev, regime:r.regime, pLong:r.pLong, pShort:r.pShort, reason:r.reason, lastClose:r.lastClose ?? null };
+        best = {
+          tf:r.tf,
+          action:r.action,
+          ev,
+          regime:r.regime,
+          pLong:r.pLong,
+          pShort:r.pShort,
+          reason:r.reason,
+          lastClose: r.lastClose ?? null
+        };
       }
     }
 
@@ -365,7 +424,6 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
   }
 });
 
-// ===== Backtest =====
 app.post("/api/engine/backtest", async (req,res)=>{
   try{
     const symbol = String(req.body?.symbol || "BTCUSDT").toUpperCase();
@@ -437,14 +495,19 @@ app.post("/api/engine/backtest", async (req,res)=>{
       for(let i=warm;i<candles.length-2;i++){
         const slice = candles.slice(0, i+1);
         const ap = atrPct(slice, 14);
+
         const tp = Math.max(0.01, ap*1.4);
         const sl = Math.max(0.01, ap*1.0);
+
         const r = predict({ symbol, tf, candles: slice, tp, sl });
         const action = r?.action || "HOLD";
         decisions++;
+
         if(action==="HOLD"){ holds++; continue; }
+
         const sim = simulateOne(candles, action, tp, sl, i, maxLook);
-        trades++; pnlSum += sim.pnl;
+        trades++;
+        pnlSum += sim.pnl;
         if(sim.outcome==="WIN") wins++;
       }
 
