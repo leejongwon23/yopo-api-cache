@@ -1,6 +1,11 @@
 /*************************************************************
  * YOPO AI PRO — server.js (FULL · BINANCE20 · EVOLVE/UPSTASH)
- * FIX: Binance 451(restricted location) -> Bybit fallback for ticker/klines
+ * FIX(2026-02-03):
+ * - Binance API returns 451 (restricted location) from Render egress.
+ * - Add DATA_PROXY_BASE (or DATA_PROXY_BASES) to route Binance requests via an allowed proxy.
+ *   Example: DATA_PROXY_BASE="https://YOUR-PROXY.DOMAIN/proxy?url="
+ *   or:      DATA_PROXY_BASES="https://p1/proxy?url=,https://p2/proxy?url="
+ * - Add /api/diag/binance to confirm connectivity (direct vs proxy).
  *************************************************************/
 import express from "express";
 import cors from "cors";
@@ -36,9 +41,18 @@ const BINANCE_FUTURES_BASES = [
   "https://fapi.binance.vision",
 ];
 
-// ✅ Bybit fallback (Render에서 Binance 451 뜰 때 살려야 함)
-const BYBIT_BASES = [
-  "https://api.bybit.com"
+// ✅ If Binance blocks Render (451), use a proxy in an allowed region.
+// Support one or many proxies. Each proxy is a PREFIX that receives the encoded upstream URL.
+// Examples:
+//  - DATA_PROXY_BASE="https://your-proxy.com/proxy?url="
+//  - DATA_PROXY_BASES="https://p1/proxy?url=,https://p2/proxy?url="
+const DATA_PROXY_BASE = (process.env.DATA_PROXY_BASE || "").trim();
+const DATA_PROXY_BASES = (process.env.DATA_PROXY_BASES || "")
+  .split(",").map(s=>s.trim()).filter(Boolean);
+
+const PROXIES = [
+  ...(DATA_PROXY_BASE ? [DATA_PROXY_BASE] : []),
+  ...DATA_PROXY_BASES
 ];
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
@@ -52,14 +66,6 @@ async function fetchWithTimeout(url, opts={}, timeoutMs=12_000){
   } finally {
     clearTimeout(t);
   }
-}
-
-async function fetchJsonWithTimeout(url, opts={}, timeoutMs=12_000){
-  const res = await fetchWithTimeout(url, opts, timeoutMs);
-  const txt = await res.text().catch(()=>"");
-  let json = null;
-  try{ json = txt ? JSON.parse(txt) : null; }catch(_e){}
-  return { res, txt, json };
 }
 
 // in-memory cache (simple)
@@ -76,7 +82,7 @@ function cacheSet(key, data){
 
 async function fetchKlines(symbol, interval="15m", limit=300){
   const candles = await fetchKlinesSafe(symbol, interval, limit);
-  if(!candles) throw new Error("BINANCE_OR_BYBIT_FETCH_FAILED");
+  if(!candles) throw new Error("BINANCE_FETCH_FAILED");
   return candles;
 }
 
@@ -112,86 +118,72 @@ function atrPctFromCandles(candles, period=14){
   return Number.isFinite(pct) && pct>0 ? pct : 0.01;
 }
 
-// ===== Bybit helpers =====
-function _toBybitInterval(interval){
-  // accepts: "15m","30m","1h","4h","1d","1w" or already "15","30","60","240","D","W"
-  const x = String(interval || "15m").toLowerCase();
-  if(x === "15m") return "15";
-  if(x === "30m") return "30";
-  if(x === "1h")  return "60";
-  if(x === "4h")  return "240";
-  if(x === "1d")  return "D";
-  if(x === "1w")  return "W";
-  // if caller gives numeric already
-  if(/^\d+$/.test(x)) return x;
-  return "15";
+// ===== Proxy-aware fetch helpers =====
+function _wrapProxy(proxyBase, upstreamUrl){
+  // proxyBase is a PREFIX (recommended) that already ends with "?url=" or similar.
+  // If user provides just a base URL without query, we still try to append.
+  if(!proxyBase) return upstreamUrl;
+  if(proxyBase.includes("?url=") || proxyBase.endsWith("=")) return proxyBase + encodeURIComponent(upstreamUrl);
+  // fallback: add ?url=
+  const join = proxyBase.includes("?") ? "&url=" : "?url=";
+  return proxyBase + join + encodeURIComponent(upstreamUrl);
 }
 
-function _parseBybitKlines(json){
-  // Bybit v5: result.list = [ [start, open, high, low, close, volume, turnover], ... ]  (DESC)
-  const list = json?.result?.list;
-  if(!Array.isArray(list) || list.length===0) return null;
+async function _fetchJsonSmart(upstreamUrl, { headers={}, timeoutMs=12_000, cacheKey=null, cacheTtlMs=0 } = {}){
+  // 1) cache
+  if(cacheKey && cacheTtlMs>0){
+    const cached = cacheGet(cacheKey, cacheTtlMs);
+    if(cached) return { ok:true, json:cached, via:"cache" };
+  }
 
-  const candles = list.map(row=>{
-    const ts = Number(row?.[0]);
-    return {
-      ts: Number.isFinite(ts) ? ts : Date.now(),
-      open: +row?.[1],
-      high: +row?.[2],
-      low:  +row?.[3],
-      close:+row?.[4],
-      volume:+row?.[5]
-    };
-  }).filter(c=>Number.isFinite(c.close));
+  // 2) try DIRECT first (maybe works sometimes)
+  let lastErr = null;
+  try{
+    const res = await fetchWithTimeout(upstreamUrl, { headers }, timeoutMs);
+    if(res.ok){
+      const j = await res.json();
+      if(cacheKey && cacheTtlMs>0) cacheSet(cacheKey, j);
+      return { ok:true, json:j, via:"direct" };
+    }else{
+      const body = await res.text().catch(()=> "");
+      lastErr = { status:res.status, body: String(body||"").slice(0, 240), via:"direct" };
+    }
+  }catch(e){
+    lastErr = { status:0, body:String(e?.message||e), via:"direct" };
+  }
 
-  // Bybit is DESC -> make ASC
-  candles.sort((a,b)=>a.ts-b.ts);
-  return candles.length ? candles : null;
-}
-
-async function fetchKlinesBybit(symbol, interval="15m", limit=300){
-  const headers = {
-    "accept":"application/json",
-    "user-agent":"YOPO-AI-PRO/1.0 (+render)"
-  };
-  const iv = _toBybitInterval(interval);
-  for(const base of BYBIT_BASES){
-    const url =
-      `${base}/v5/market/kline?category=linear` +
-      `&symbol=${encodeURIComponent(symbol)}` +
-      `&interval=${encodeURIComponent(iv)}` +
-      `&limit=${encodeURIComponent(limit)}`;
+  // 3) if blocked / failed, try PROXIES (if any)
+  for(const p of PROXIES){
+    const proxiedUrl = _wrapProxy(p, upstreamUrl);
     try{
-      const { res, json, txt } = await fetchJsonWithTimeout(url, { headers }, 12_000);
-      if(!res.ok){
+      const res = await fetchWithTimeout(proxiedUrl, { headers }, timeoutMs);
+      if(res.ok){
+        const j = await res.json();
+        if(cacheKey && cacheTtlMs>0) cacheSet(cacheKey, j);
+        return { ok:true, json:j, via:"proxy" };
+      }else{
+        const body = await res.text().catch(()=> "");
+        lastErr = { status:res.status, body:String(body||"").slice(0, 240), via:"proxy" };
         continue;
       }
-      // Bybit success: retCode===0
-      if(json?.retCode !== 0){
-        // sometimes rate-limits etc.
-        continue;
-      }
-      const candles = _parseBybitKlines(json);
-      if(candles && candles.length){
-        return candles;
-      }
-    }catch(_e){
+    }catch(e){
+      lastErr = { status:0, body:String(e?.message||e), via:"proxy" };
       continue;
     }
   }
-  return null;
+
+  return { ok:false, err:lastErr || { status:0, body:"UNKNOWN", via:"none" } };
 }
 
 /**
- * ✅ Safe klines fetch:
- * - Try Binance Futures first
- * - If Binance blocked (451) or fails, fallback to Bybit
- * - Returns null on total failure
- * - Caches successful results briefly
+ * Safe klines fetch
+ * - Tries futures endpoints.
+ * - If Binance blocks (451), tries DATA_PROXY_BASE(S) automatically.
+ * - Returns null on failure (never hard-crash engine endpoints).
  */
 async function fetchKlinesSafe(symbol, interval="15m", limit=300){
-  const key = `klines:${symbol}:${interval}:${limit}`;
-  const cached = cacheGet(key, 20_000);
+  const keyCandles = `klines:${symbol}:${interval}:${limit}`;
+  const cached = cacheGet(keyCandles, 20_000);
   if(cached) return cached;
 
   const headers = {
@@ -199,49 +191,33 @@ async function fetchKlinesSafe(symbol, interval="15m", limit=300){
     "user-agent":"YOPO-AI-PRO/1.0 (+render)"
   };
 
-  // 1) Binance attempt
   let lastErr = null;
+
   for(const base of BINANCE_FUTURES_BASES){
-    try{
-      const url = `${base}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
-      const res = await fetchWithTimeout(url, { headers }, 12_000);
-      if(!res.ok){
-        let body = "";
-        try{ body = (await res.text()).slice(0, 200); }catch(_e){}
-        // 451 is the killer in your logs
-        lastErr = new Error(`BINANCE_${res.status} ${body}`);
-        // small backoff for 429/418/451
-        if(res.status===429 || res.status===418 || res.status===451){
-          await sleep(250);
-        }
-        continue;
-      }
-      const arr = await res.json();
-      const candles = _parseKlinesArray(arr);
-      if(!candles || candles.length===0){
-        lastErr = new Error(`BINANCE_EMPTY ${url}`);
-        continue;
-      }
-      cacheSet(key, candles);
-      return candles;
-    }catch(e){
-      lastErr = e;
+    const url = `${base}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+
+    const r = await _fetchJsonSmart(url, { headers, timeoutMs:12_000 });
+    if(!r.ok){
+      lastErr = r.err;
+      // mild backoff for rate limits
+      if(r.err?.status===429 || r.err?.status===418) await sleep(350);
       continue;
     }
+
+    const candles = _parseKlinesArray(r.json);
+    if(!candles || candles.length===0){
+      lastErr = { status:0, body:"EMPTY", via:r.via };
+      continue;
+    }
+
+    cacheSet(keyCandles, candles);
+    return candles;
   }
 
-  // 2) Bybit fallback
-  try{
-    const candles = await fetchKlinesBybit(symbol, interval, limit);
-    if(candles && candles.length){
-      cacheSet(key, candles);
-      return candles;
-    }
-  }catch(_e){}
-
-  console.error("[YOPO][fetchKlinesSafe] fail", symbol, interval, limit, String(lastErr?.message || lastErr));
+  console.error("[YOPO][fetchKlinesSafe] fail", symbol, interval, limit, lastErr?.status || "", lastErr?.via || "", lastErr?.body || "");
   return null;
 }
+
 
 // ===== Upstash helpers (optional) =====
 const UP_URL = process.env.UPSTASH_REDIS_REST_URL || "";
@@ -258,14 +234,12 @@ async function upstashCommand(cmd, args=[]){
 }
 
 async function evolveAppend(eventObj){
-  // store as LPUSH json, then LTRIM
   if(UP_URL && UP_TOKEN){
     const payload = JSON.stringify(eventObj);
     await upstashCommand("lpush", [EVOLVE_KEY, payload]);
     await upstashCommand("ltrim", [EVOLVE_KEY, "0", String(EVOLVE_MAX-1)]);
     return { storage:"upstash" };
   }
-  // fallback: no persistent storage if Upstash absent
   return { storage:"none" };
 }
 
@@ -282,33 +256,50 @@ async function evolveStats(){
 app.get("/", (req,res)=>res.json({ ok:true, service:"YOPO AI PRO API", status:"running" }));
 app.get("/ping", (req,res)=>res.send("pong"));
 
-// ===== Lightweight helpers for UI (no heavy compute) =====
-app.get("/api/universe/top20", (req,res)=>{
-  res.json({ ok:true, symbols: UNIVERSE20 });
-});
+// ✅ Quick diag: see if Binance is blocked (direct) and whether proxy works.
+app.get("/api/diag/binance", async (req,res)=>{
+  const symbol = String(req.query?.symbol || "BTCUSDT").toUpperCase();
+  const interval = String(req.query?.interval || "15m");
+  const limit = Math.max(10, Math.min(200, Number(req.query?.limit || 50)));
 
-async function fetchTickerPriceBybit(symbol){
   const headers = {
     "accept":"application/json",
     "user-agent":"YOPO-AI-PRO/1.0 (+render)"
   };
-  for(const base of BYBIT_BASES){
-    const url = `${base}/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`;
-    try{
-      const { res, json } = await fetchJsonWithTimeout(url, { headers }, 10_000);
-      if(!res.ok) continue;
-      if(json?.retCode !== 0) continue;
-      const item = json?.result?.list?.[0];
-      const price = Number(item?.lastPrice);
-      const chg = Number(item?.price24hPcnt) * 100; // Bybit is ratio (ex: 0.0123)
-      if(!Number.isFinite(price)) continue;
-      return { price, chg: Number.isFinite(chg) ? chg : 0 };
-    }catch(_e){
-      continue;
+
+  const testUrl = `${BINANCE_FUTURES_BASES[0]}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+
+  // direct only (no proxy)
+  let direct = null;
+  try{
+    const r = await fetchWithTimeout(testUrl, { headers }, 10_000);
+    if(r.ok){
+      const j = await r.json();
+      direct = { ok:true, status:r.status, sample:Array.isArray(j) ? j.length : 0 };
+    }else{
+      const body = await r.text().catch(()=> "");
+      direct = { ok:false, status:r.status, body:String(body||"").slice(0, 200) };
     }
+  }catch(e){
+    direct = { ok:false, status:0, body:String(e?.message||e) };
   }
-  return null;
-}
+
+  // proxy path (uses configured PROXIES)
+  const smart = await _fetchJsonSmart(testUrl, { headers, timeoutMs:10_000 });
+
+  res.json({
+    ok:true,
+    symbol, interval, limit,
+    proxiesConfigured: PROXIES.length,
+    direct,
+    smart: smart.ok ? { ok:true, via:smart.via, sample:Array.isArray(smart.json) ? smart.json.length : 0 } : { ok:false, ...smart.err }
+  });
+});
+
+// ===== Lightweight helpers for UI =====
+app.get("/api/universe/top20", (req,res)=>{
+  res.json({ ok:true, symbols: UNIVERSE20 });
+});
 
 async function fetchTickerPrice(symbol){
   const key = `ticker:${symbol}`;
@@ -320,53 +311,39 @@ async function fetchTickerPrice(symbol){
     "user-agent":"YOPO-AI-PRO/1.0 (+render)"
   };
 
-  // 1) Binance attempt
   let lastErr = null;
   for(const base of BINANCE_FUTURES_BASES){
-    try{
-      const url = `${base}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-      const res = await fetchWithTimeout(url, { headers }, 10_000);
-      if(!res.ok){
-        let body = "";
-        try{ body = (await res.text()).slice(0, 200); }catch(_e){}
-        lastErr = new Error(`${res.status} ${body}`);
-        continue;
-      }
-      const j = await res.json();
-      const price = Number(j?.lastPrice);
-      const chg = Number(j?.priceChangePercent);
-      if(!Number.isFinite(price)) throw new Error("BAD_TICKER_PRICE");
-      const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
-      cacheSet(key, out);
-      return out;
-    }catch(e){
-      lastErr = e;
+    const url = `${base}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+
+    const r = await _fetchJsonSmart(url, { headers, timeoutMs:10_000 });
+    if(!r.ok){
+      lastErr = r.err;
       continue;
     }
+
+    const j = r.json;
+    const price = Number(j?.lastPrice);
+    const chg = Number(j?.priceChangePercent);
+    if(!Number.isFinite(price)){
+      lastErr = { status:0, body:"BAD_TICKER_PRICE", via:r.via };
+      continue;
+    }
+
+    const out = { price, chg: Number.isFinite(chg) ? chg : 0 };
+    cacheSet(key, out);
+    return out;
   }
 
-  // 2) Bybit fallback
-  try{
-    const out = await fetchTickerPriceBybit(symbol);
-    if(out && Number.isFinite(out.price)){
-      cacheSet(key, out);
-      return out;
-    }
-  }catch(_e){}
-
-  console.error("[YOPO][fetchTickerPrice] fail", symbol, String(lastErr?.message||lastErr));
+  console.error("[YOPO][fetchTickerPrice] fail", symbol, lastErr?.status || "", lastErr?.via || "", lastErr?.body || "");
   return null;
 }
 
+// ===== MARKET TICK =====
 app.get("/api/market/tick", async (req,res)=>{
   try{
-    // ✅ Supports both:
-    // - /api/market/tick?symbol=BTCUSDT
-    // - /api/market/tick?symbols=BTCUSDT,ETHUSDT
     const qsSymbol = req.query?.symbol;
     const qsSymbols = req.query?.symbols;
 
-    // Build symbol list
     let list = [];
     if(typeof qsSymbols === "string" && qsSymbols.trim()){
       list = qsSymbols.split(",").map(s=>String(s).trim().toUpperCase()).filter(Boolean);
@@ -375,15 +352,14 @@ app.get("/api/market/tick", async (req,res)=>{
     }else{
       list = ["BTCUSDT"];
     }
-
-    // Limit to avoid abuse (UI needs max 20)
     if(list.length > 30) list = list.slice(0, 30);
 
     const out = {};
     for(const sym of list){
+      // 1) try ticker
       let t = await fetchTickerPrice(sym);
 
-      // fallback last candle close (best-effort) -> now also benefits from Bybit klines
+      // 2) fallback to last candle close (if ticker fails)
       if(!t){
         const candles = await fetchKlinesSafe(sym, "15m", 50);
         if(candles && candles.length){
@@ -397,35 +373,29 @@ app.get("/api/market/tick", async (req,res)=>{
       }
     }
 
-    // Backward compatibility:
-    // If caller used single-symbol mode, return flat shape.
+    // single-symbol mode: keep old shape
     if(list.length === 1 && !qsSymbols){
       const sym = list[0];
       const v = out[sym] || null;
-      if(v){
-        return res.json({ ok:true, symbol:sym, price:v.price, chg:v.chgPct });
-      }
-      // Soft response (still 200)
+      if(v) return res.json({ ok:true, symbol:sym, price:v.price, chg:v.chgPct });
       return res.json({ ok:false, symbol:sym, error:"NO_TICK", message:"NO_DATA" });
     }
 
-    // Multi-symbol response (recommended for UI)
     return res.json({ ok:true, data: out, symbols: list });
   }catch(e){
     console.error("[YOPO][tick]", e?.stack || String(e));
-    // still return 200 so the browser doesn't spam "Failed to load resource" errors
     return res.json({ ok:false, error:"TICK_FAILED", message:String(e?.message||e) });
   }
 });
+
 
 // ===== Engine =====
 app.post("/api/engine/predict6tf", async (req,res)=>{
   try{
     const symbol = (req.body?.symbol || "BTCUSDT").toUpperCase();
-    const tfs = ["15m","30m","1h","4h","1d","1w"]; // spec
+    const tfs = ["15m","30m","1h","4h","1d","1w"];
     const results = [];
 
-    // fallback last price (best effort)
     let lastPrice = null;
     try{
       const t = await fetchTickerPrice(symbol);
@@ -459,6 +429,7 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
         const out = predict({ symbol, tf, candles, tp, sl });
         out.tpPct = tp;
         out.slPct = sl;
+
         const lastClose = Number(candles[candles.length-1]?.close);
         results.push({ tf, ...out, lastClose: Number.isFinite(lastClose) ? lastClose : (Number.isFinite(lastPrice) ? lastPrice : null) });
       }catch(e){
@@ -496,10 +467,10 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
     });
   }catch(e){
     console.error("[YOPO][predict6tf]", e?.stack || String(e));
-    // 200 with ok:false -> browser won't hard-break
     res.json({ ok:false, message:String(e?.message||e) });
   }
 });
+
 
 app.post("/api/engine/backtest", async (req,res)=>{
   try{
@@ -545,7 +516,6 @@ app.post("/api/engine/backtest", async (req,res)=>{
           const hitSL = (l <= sl);
           const hitTP = (h >= tp);
           if(hitSL && hitTP){
-            // conservative: SL first
             return { outcome:"LOSS", pnl:-slPct };
           }
           if(hitTP) return { outcome:"WIN", pnl:+tpPct };
@@ -582,7 +552,6 @@ app.post("/api/engine/backtest", async (req,res)=>{
         const slice = candles.slice(0, i+1);
         const ap = atrPct(slice, 14);
 
-        // dynamic tp/sl but never below 1% (rule)
         const tp = Math.max(0.01, ap*1.4);
         const sl = Math.max(0.01, ap*1.0);
 
