@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 // 20-coin universe (Binance Futures USDT)
 const UNIVERSE20 = [
@@ -96,6 +96,48 @@ function _parseKlinesArray(arr){
     close:+k[4],
     volume:+k[5]
   }));
+}
+
+// ===== Client-provided candles support (no-exchange mode) =====
+// If Render egress is blocked (e.g., 451), the browser can fetch public data and send it here.
+// Accept both formats:
+//  - object candles: [{ts,open,high,low,close,volume}, ...]
+//  - raw kline arrays: [[ts,open,high,low,close,volume,...], ...]
+function normalizeCandles(input){
+  if(!input) return null;
+  if(!Array.isArray(input)) return null;
+  if(input.length===0) return [];
+  const first = input[0];
+  // raw klines arrays
+  if(Array.isArray(first)){
+    return _parseKlinesArray(input);
+  }
+  // object candles
+  if(typeof first === "object"){
+    return input.map(c=>({
+      ts: Number(c.ts ?? c.t ?? c[0]),
+      open: +c.open,
+      high: +c.high,
+      low:  +c.low,
+      close:+c.close,
+      volume:+(c.volume ?? c.vol ?? c.v ?? 0)
+    })).filter(c=>Number.isFinite(c.ts) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close));
+  }
+  return null;
+}
+
+function getClientCandles(req, tf){
+  // payload examples:
+  //  - { candlesByTf: { "15m":[...], "1h":[...] } }
+  //  - { candles: [...] } (single tf)
+  const byTf = req?.body?.candlesByTf;
+  if(byTf && typeof byTf === "object" && byTf[tf]){
+    return normalizeCandles(byTf[tf]);
+  }
+  if(req?.body?.candles){
+    return normalizeCandles(req.body.candles);
+  }
+  return null;
 }
 
 function atrPctFromCandles(candles, period=14){
@@ -404,7 +446,8 @@ app.post("/api/engine/predict6tf", async (req,res)=>{
 
     for(const tf of tfs){
       const interval = TF_MAP[tf] || tf;
-      const candles = await fetchKlinesSafe(symbol, interval, 300);
+      const clientCandles = getClientCandles(req, tf);
+      const candles = clientCandles || await fetchKlinesSafe(symbol, interval, 300);
 
       if(!candles || candles.length < 60){
         results.push({
@@ -534,7 +577,8 @@ app.post("/api/engine/backtest", async (req,res)=>{
     }
 
     async function backtestTF(tf){
-      const candles = await fetchKlinesSafe(symbol, TF_MAP[tf], limit);
+      const clientCandles = getClientCandles(req, tf);
+      const candles = clientCandles || await fetchKlinesSafe(symbol, TF_MAP[tf], limit);
       if(!candles || candles.length < 120){
         return { tf, trades:0, winRate:0, avgPnl:0, holdRate:1, note:"NO_CANDLES" };
       }
